@@ -69,7 +69,7 @@ def load_training_state(
     start_epoch = ckpt.get("epoch", -1) + 1
     best_val_loss = ckpt.get("val_loss", float("inf"))
     logger.info(
-        "Resumed from %s — continuing at epoch %d (best_val_loss=%.4f)",
+        "Resumed from %s - continuing at epoch %d (best_val_loss=%.4f)",
         checkpoint_path,
         start_epoch,
         best_val_loss,

@@ -42,9 +42,9 @@ def fmt_row(
     ssim: float | None = None,
     psnr: float | None = None,
 ) -> str:
-    fid_s = f"{fid:>8.2f}" if fid is not None else f"{'—':>8s}"
-    ssim_s = f"{ssim:>6.4f}" if ssim is not None else f"{'—':>6s}"
-    psnr_s = f"{psnr:>7.2f}" if psnr is not None else f"{'—':>7s}"
+    fid_s = f"{fid:>8.2f}" if fid is not None else f"{'-':>8s}"
+    ssim_s = f"{ssim:>6.4f}" if ssim is not None else f"{'-':>6s}"
+    psnr_s = f"{psnr:>7.2f}" if psnr is not None else f"{'-':>7s}"
     return (
         f"{epoch + 1:>4d}/{total_epochs:<5d}  {SEP}{phase:>6s}{SEP}"
         f"{loss:>12.4f}{SEP}{recon:>12.4f}{SEP}{kl:>12.4f}{SEP}"
@@ -68,18 +68,18 @@ def append_stats(
     write_header = not log_path.exists() or log_path.stat().st_size == 0
     if not write_header:
         try:
-            with open(log_path, "r") as rf:
+            with open(log_path, "r", encoding="utf-8") as rf:
                 write_header = not any(_STATS_LOG_HEADER in line for line in rf)
         except OSError:
             write_header = True
-    with open(log_path, "a") as fh:
+    with open(log_path, "a", encoding="utf-8") as fh:
         if write_header:
             fh.write(f"{_STATS_LOG_DIVIDER}\n")
             fh.write(f"{_STATS_LOG_HEADER}\n")
             fh.write(f"{_STATS_LOG_DIVIDER}\n")
-        fid_s = f"{fid:>10.2f}" if fid is not None else f"{'—':>10s}"
-        ssim_s = f"{ssim:>8.4f}" if ssim is not None else f"{'—':>8s}"
-        psnr_s = f"{psnr:>8.2f}" if psnr is not None else f"{'—':>8s}"
+        fid_s = f"{fid:>10.2f}" if fid is not None else f"{'-':>10s}"
+        ssim_s = f"{ssim:>8.4f}" if ssim is not None else f"{'-':>8s}"
+        psnr_s = f"{psnr:>8.2f}" if psnr is not None else f"{'-':>8s}"
         row = (
             f"{model_type:<25s}{_STATS_LOG_SEP}"
             f"{epoch + 1:>4d}/{total_epochs:<5d}{_STATS_LOG_SEP}"

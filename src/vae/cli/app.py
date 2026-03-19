@@ -92,15 +92,15 @@ def cmd_run_all(args: argparse.Namespace) -> None:
         try:
             checkpoint = resolve_latest_checkpoint(args.config, getattr(args, "model", None))
         except FileNotFoundError as exc:
-            logger.error("%s — run without --skip-train first.", exc)
+            logger.error("%s - run without --skip-train first.", exc)
             sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("Running validation on test split …")
+    logger.info("Running validation on test split ...")
     run_validation(checkpoint_path=checkpoint, config_path=args.config, split="test")
 
     logger.info("=" * 60)
-    logger.info("Generating outputs …")
+    logger.info("Generating outputs ...")
     generate_samples(checkpoint, args.config, num_samples=64)
     generate_reconstructions(checkpoint, args.config, num_images=16)
     generate_interpolations(checkpoint, args.config)
@@ -112,7 +112,7 @@ def cmd_run_all(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vae",
-        description="Beta-VAE with cyclical annealing — CIFAR-10 (configurable image size)",
+        description="Beta-VAE with cyclical annealing - CIFAR-10 (configurable image size)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging")
     sub = parser.add_subparsers(dest="command")

@@ -235,7 +235,7 @@ def train(
 
             if patience and epochs_without_improvement >= patience:
                 print(DIVIDER)
-                print(f"  Early stopping — no improvement for {patience} epochs.")
+                print(f"  Early stopping - no improvement for {patience} epochs.")
                 break
 
         if save_interval and (epoch + 1) % save_interval == 0:
