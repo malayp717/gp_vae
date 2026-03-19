@@ -53,17 +53,16 @@ def save_kl_per_dim_artifacts(
         alpha=0.95,
     )
 
-    ax.set_title(
+    fig.suptitle(
         f"KL per dimension ({model_type}, epoch {epoch + 1:04d})",
         fontsize=16,
         fontweight="semibold",
-        pad=14,
+        y=0.975,
     )
-    ax.text(
+    fig.text(
         0.5,
-        1.01,
+        0.942,
         f"Latent dimensions sorted by descending KL. Active dims (> {threshold:.1f} nats): {active_dims}/{n_dims}",
-        transform=ax.transAxes,
         ha="center",
         va="bottom",
         fontsize=10.5,
@@ -111,7 +110,7 @@ def save_kl_per_dim_artifacts(
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.90))
     fig.savefig(
         log_dir / f"kl_per_dim_{model_type}_epoch_{epoch + 1:04d}.png",
         dpi=220,

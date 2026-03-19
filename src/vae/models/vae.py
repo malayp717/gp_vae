@@ -86,10 +86,10 @@ class VAE(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        latent_dim: int = 512,
-        encoder_channels: Sequence[int] = (32, 64, 128, 256, 512),
-        decoder_channels: Sequence[int] = (512, 256, 128, 64, 32),
-        image_size: int = 224,
+        latent_dim: int = 256,
+        encoder_channels: Sequence[int] = (32, 64, 128, 128, 256),
+        decoder_channels: Sequence[int] = (256, 128, 128, 64, 32),
+        image_size: int = 32,
         dropout: float = 0.1,
         use_batch_norm: bool = True,
     ) -> None:

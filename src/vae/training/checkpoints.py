@@ -14,6 +14,18 @@ from vae.runtime.device import get_device
 logger = logging.getLogger(__name__)
 
 
+def model_checkpoint_dir(checkpoint_dir: Path, model_type: str) -> Path:
+    """Return the subdirectory that stores checkpoints for one model type."""
+    return checkpoint_dir / model_type
+
+
+def periodic_checkpoint_path(checkpoint_dir: Path, model_type: str, epoch: int) -> Path:
+    """Return the periodic checkpoint path for a model and epoch index."""
+    model_dir = model_checkpoint_dir(checkpoint_dir, model_type)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    return model_dir / f"{model_type}_epoch_{epoch + 1:04d}.pt"
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -102,10 +114,11 @@ def latest_checkpoint_path(
     model_type: str,
 ) -> Path:
     """Return the latest periodic checkpoint for the model."""
-    checkpoints = sorted(checkpoint_dir.glob(f"{model_type}_epoch_*.pt"))
+    model_dir = model_checkpoint_dir(checkpoint_dir, model_type)
+    checkpoints = sorted(model_dir.glob(f"{model_type}_epoch_*.pt"))
     if not checkpoints:
         raise FileNotFoundError(
-            f"No periodic checkpoints found for model '{model_type}' in {checkpoint_dir}"
+            f"No periodic checkpoints found for model '{model_type}' in {model_dir}"
         )
     return checkpoints[-1]
 

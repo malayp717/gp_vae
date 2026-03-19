@@ -19,7 +19,7 @@ def _list_of_ints(values: list[Any], field_name: str) -> list[int]:
 @dataclass(slots=True)
 class DataConfig:
     dataset: str = "cifar10"
-    image_size: int = 128
+    image_size: int = 32
     in_channels: int = 3
     batch_size: int = 64
     num_workers: int = 4
@@ -48,7 +48,7 @@ class ModelConfig:
     latent_dim: int = 256
     encoder_channels: list[int] = field(default_factory=lambda: [32, 64, 128, 128, 256])
     decoder_channels: list[int] = field(default_factory=lambda: [256, 128, 128, 64, 32])
-    patch_div: int = 4
+    patch_div: int = 2
     latent_dim_per_patch: int = 128
     patch_encoder_channels: list[int] = field(default_factory=lambda: [32, 64, 128, 256])
     patch_decoder_channels: list[int] = field(default_factory=lambda: [256, 128, 64, 32])
@@ -57,12 +57,36 @@ class ModelConfig:
     transformer_layers: int = 4
     transformer_dropout: float = 0.1
     covariance_rank: int = 16
+    dit_depth: int = 6
+    dit_heads: int = 4
+    dit_dropout: float = 0.1
+    num_classes: int = 10
+    diffusion_T: int = 1000
+    sample_steps: int = 1
+    ddpm_base_channels: int = 64
+    ddpm_channel_multipliers: list[int] = field(default_factory=lambda: [1, 2, 4])
+    ddpm_num_res_blocks: int = 2
+    ddpm_dropout: float = 0.0
+    ddpm_beta_schedule: str = "linear"
+    ddpm_sample_steps: int = 1000
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ModelConfig":
         cfg = cls(**data)
-        if cfg.type not in {"vae", "gp_vae"}:
+        if cfg.type not in {"vae", "gp_vae", "sccd", "ddpm"}:
             raise ValueError(f"Unsupported model type: {cfg.type!r}")
+        if cfg.sample_steps <= 0:
+            raise ValueError("`model.sample_steps` must be positive")
+        if cfg.ddpm_sample_steps <= 0:
+            raise ValueError("`model.ddpm_sample_steps` must be positive")
+        if cfg.diffusion_T <= 0:
+            raise ValueError("`model.diffusion_T` must be positive")
+        if cfg.ddpm_num_res_blocks <= 0:
+            raise ValueError("`model.ddpm_num_res_blocks` must be positive")
+        if cfg.ddpm_base_channels <= 0:
+            raise ValueError("`model.ddpm_base_channels` must be positive")
+        if cfg.ddpm_beta_schedule not in {"linear", "cosine"}:
+            raise ValueError("`model.ddpm_beta_schedule` must be one of {'linear', 'cosine'}")
         cfg.encoder_channels = _list_of_ints(cfg.encoder_channels, "model.encoder_channels")
         cfg.decoder_channels = _list_of_ints(cfg.decoder_channels, "model.decoder_channels")
         cfg.patch_encoder_channels = _list_of_ints(
@@ -70,6 +94,9 @@ class ModelConfig:
         )
         cfg.patch_decoder_channels = _list_of_ints(
             cfg.patch_decoder_channels, "model.patch_decoder_channels"
+        )
+        cfg.ddpm_channel_multipliers = _list_of_ints(
+            cfg.ddpm_channel_multipliers, "model.ddpm_channel_multipliers"
         )
         return cfg
 
@@ -103,12 +130,18 @@ class TrainingConfig:
     mixed_precision: bool = True
     compile_model: bool = False
     early_stopping_patience: int = 20
+    ema_decay: float = 0.999
+    consistency_k_steps: int = 5
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrainingConfig":
         cfg = cls(**data)
         if cfg.epochs <= 0:
             raise ValueError("`training.epochs` must be positive")
+        if cfg.consistency_k_steps <= 0:
+            raise ValueError("`training.consistency_k_steps` must be positive")
+        if not 0.0 < cfg.ema_decay <= 1.0:
+            raise ValueError("`training.ema_decay` must be in (0, 1]")
         return cfg
 
 
@@ -123,12 +156,15 @@ class LossConfig:
     adv_start_epoch: int = 5
     disc_channels: int = 64
     disc_layers: int = 3
+    consistency_weight: float = 1.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LossConfig":
         cfg = cls(**data)
         if cfg.lpips_net not in {"alex", "vgg"}:
             raise ValueError(f"Unsupported LPIPS backbone: {cfg.lpips_net!r}")
+        if cfg.consistency_weight < 0.0:
+            raise ValueError("`loss.consistency_weight` must be non-negative")
         return cfg
 
 

@@ -1,4 +1,4 @@
-"""CIFAR-10 data loading with train/val/test splits resized to configured size."""
+"""CIFAR-10 data loading with train/val/test splits at configurable resolution."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def get_cifar10_dataloaders(
 ) -> tuple[DataLoader[Any], DataLoader[Any], DataLoader[Any]]:
     """Create train, validation, and test loaders for CIFAR-10."""
     data_cfg = config["data"]
-    image_size = int(data_cfg.get("image_size", 224))
+    image_size = int(data_cfg.get("image_size", 32))
     batch_size = int(data_cfg.get("batch_size", 64))
     num_workers = int(data_cfg.get("num_workers", 4))
     pin_memory = bool(data_cfg.get("pin_memory", True))

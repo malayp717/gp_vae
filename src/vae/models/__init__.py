@@ -1,10 +1,13 @@
 from .base import SupportsVAEAPI, encode_latent_mean, get_kl_override, get_kl_per_dim
+from .ddpm import DDPMModel
 from .factory import build_model
 from .gp_vae import GeneralizedPosteriorVAE
 from .vae import Decoder, Encoder, VAE
+from .sccd import SCCDModel
 
 __all__ = [
     "Decoder",
+    "DDPMModel",
     "Encoder",
     "GeneralizedPosteriorVAE",
     "SupportsVAEAPI",
@@ -13,5 +16,6 @@ __all__ = [
     "encode_latent_mean",
     "get_kl_override",
     "get_kl_per_dim",
+    "SCCDModel",
 ]
 

@@ -1,10 +1,10 @@
 # =============================================================================
-# VAE with Beta Annealing — CIFAR-10 (configurable image size)
+# VAE with Beta Annealing - CIFAR-10 (native-resolution default)
 # =============================================================================
 
 data:
   dataset: cifar10
-  image_size: 128
+  image_size: 32                # keep CIFAR-10 at its native 32x32 resolution
   in_channels: 3
   batch_size: 128
   num_workers: 4
@@ -14,31 +14,47 @@ data:
   val_split: 0.1
 
 model:
-  type: vae                     # vae | gp_vae
+  type: vae                     # vae | gp_vae | sccd | ddpm
 
   # --- shared ---
   dropout: 0.1
   use_batch_norm: true
 
-  # --- VAE (convolutional) — 5 layers to keep decoder FC small (7×7 init) ---
+  # --- VAE (convolutional) ---
   latent_dim: 256
-  encoder_channels: [32, 64, 128, 128, 256]
-  decoder_channels: [256, 128, 128, 64, 32]
+  encoder_channels: [32, 64, 128, 128, 256]   # vary these per dataset/model scale
+  decoder_channels: [256, 128, 128, 64, 32]   # vary these per dataset/model scale
 
-  # --- Patch-VAE ---
-  patch_div: 4                  # grid divisions per side (4 → 16 patches of 32×32)
-  latent_dim_per_patch: 128     # per-patch latent dim (total = 16 × 128 = 2048)
-  patch_encoder_channels: [32, 64, 128, 256]
-  patch_decoder_channels: [256, 128, 64, 32]
+  # --- Patch models (GP-VAE / SCCD) ---
+  patch_div: 2                  # 2x2 grid -> 4 patches total; CIFAR-10 patches are 16x16x3
+  latent_dim_per_patch: 128     # per-patch latent dim (total = 4 x 128 = 512)
+  patch_encoder_channels: [32, 64, 128, 256]  # vary these per dataset/model scale
+  patch_decoder_channels: [256, 128, 64, 32]  # vary these per dataset/model scale
 
-  # --- Patch-Transformer-VAE & GP-VAE (shared transformer config) ---
+  # --- Patch-Transformer-VAE, GP-VAE, and SCCD (shared transformer config) ---
   transformer_dim: 256            # hidden size of transformer
   transformer_heads: 8
   transformer_layers: 4
   transformer_dropout: 0.1
 
-  # --- GP-VAE only (extends Patch-Transformer-VAE with structured covariance) ---
-  covariance_rank: 16             # rank k of low-rank factor V (k << d)
+  # --- GP-VAE and SCCD (structured posterior covariance) ---
+  covariance_rank: 4             # rank k of low-rank factor V (k << d)
+
+  # --- SCCD only (consistency-distilled DiT denoiser) ---
+  dit_depth: 6
+  dit_heads: 4
+  dit_dropout: 0.1
+  num_classes: 10
+  diffusion_T: 1000
+  sample_steps: 1
+
+  # --- DDPM only (pixel-space U-Net denoiser) ---
+  ddpm_base_channels: 64
+  ddpm_channel_multipliers: [1, 2, 4]
+  ddpm_num_res_blocks: 2
+  ddpm_dropout: 0.0
+  ddpm_beta_schedule: linear
+  ddpm_sample_steps: 1000
 
 beta_annealing:
   enabled: true
@@ -59,6 +75,8 @@ training:
   mixed_precision: true
   compile_model: false        # torch.compile (PyTorch 2+)
   early_stopping_patience: 20
+  ema_decay: 0.999            # SCCD EMA decay for the target denoiser
+  consistency_k_steps: 5      # SCCD timestep gap between t and t'
 
 loss:
   recon_weight: 1.0              # MSE reconstruction weight
@@ -70,6 +88,7 @@ loss:
   adv_start_epoch: 5            # delay adv loss until VAE learns basic reconstruction
   disc_channels: 64              # base channels in discriminator
   disc_layers: 3                 # strided layers in discriminator
+  consistency_weight: 1.0        # SCCD consistency loss weight
 
 optimizer:
   name: adamw

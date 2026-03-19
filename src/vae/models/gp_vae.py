@@ -96,13 +96,13 @@ class GeneralizedPosteriorVAE(nn.Module):
 
     def __init__(
         self,
-        image_size: int = 224,
-        patch_div: int = 4,
+        image_size: int = 32,
+        patch_div: int = 2,
         in_channels: int = 3,
-        latent_dim: int = 32,
+        latent_dim: int = 128,
         covariance_rank: int = 8,
-        encoder_channels: Sequence[int] = (32, 64, 128),
-        decoder_channels: Sequence[int] = (128, 64, 32),
+        encoder_channels: Sequence[int] = (32, 64, 128, 256),
+        decoder_channels: Sequence[int] = (256, 128, 64, 32),
         transformer_dim: int = 256,
         transformer_heads: int = 8,
         transformer_layers: int = 4,
