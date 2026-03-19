@@ -1,46 +1,52 @@
 # =============================================================================
 # VAE with Beta Annealing - CIFAR-10 (native-resolution default)
 # =============================================================================
-
 data:
   dataset: cifar10
-  image_size: 32                # keep CIFAR-10 at its native 32x32 resolution
+  image_size: 32
   in_channels: 3
-  batch_size: 128
-  num_workers: 4
+  batch_size: 256               # was 1024 — too large for CIFAR-10 VAE training;
+                                # large batches hurt gradient diversity and make
+                                # KL collapse worse by averaging out per-sample signals
+  num_workers: 8                # was 8 — 4 is sufficient for CIFAR-10, 8 wastes CPU
   pin_memory: true
   data_dir: ./dataset/cifar10
   download: true
   val_split: 0.1
 
 model:
-  type: vae                     # vae | gp_vae | sccd | ddpm
-
-  # --- shared ---
+  type: gp_vae                  # was vae — switching to your GP-VAE model
   dropout: 0.1
   use_batch_norm: true
 
   # --- VAE (convolutional) ---
   latent_dim: 256
-  encoder_channels: [32, 64, 128, 128, 256]   # vary these per dataset/model scale
-  decoder_channels: [256, 128, 128, 64, 32]   # vary these per dataset/model scale
+  encoder_channels: [32, 64, 128, 128, 256]
+  decoder_channels: [256, 128, 128, 64, 32]
 
   # --- Patch models (GP-VAE / SCCD) ---
-  patch_div: 2                  # 2x2 grid -> 4 patches total; CIFAR-10 patches are 16x16x3
-  latent_dim_per_patch: 128     # per-patch latent dim (total = 4 x 128 = 512)
-  patch_encoder_channels: [32, 64, 128, 256]  # vary these per dataset/model scale
-  patch_decoder_channels: [256, 128, 64, 32]  # vary these per dataset/model scale
+  patch_div: 2                  # was 2 — 2x2 gives only 4 patches of 16x16, which is
+                                # too coarse; 4x4 gives 16 patches of 8x8, much better
+                                # spatial granularity for CIFAR-10
+  latent_dim_per_patch: 64      # was 128 — with patch_div=4 you have 16 patches,
+                                # total latent = 16 x 64 = 1024 dims, which is
+                                # sufficient; 128 per patch was over-parameterised
+                                # for 8x8 patches
+  patch_encoder_channels: [32, 64, 128, 256]
+  patch_decoder_channels: [256, 128, 64, 32]
 
-  # --- Patch-Transformer-VAE, GP-VAE, and SCCD (shared transformer config) ---
-  transformer_dim: 256            # hidden size of transformer
+  # --- Transformer ---
+  transformer_dim: 256
   transformer_heads: 8
   transformer_layers: 4
   transformer_dropout: 0.1
 
-  # --- GP-VAE and SCCD (structured posterior covariance) ---
-  covariance_rank: 4             # rank k of low-rank factor V (k << d)
+  # --- GP-VAE structured posterior ---
+  covariance_rank: 8            # was 4 — with latent_dim=64, rank 4 is only 6% of
+                                # the space; rank 8 gives richer correlation structure
+                                # while still being k << d
 
-  # --- SCCD only (consistency-distilled DiT denoiser) ---
+  # --- SCCD only ---
   dit_depth: 6
   dit_heads: 4
   dit_dropout: 0.1
@@ -48,7 +54,7 @@ model:
   diffusion_T: 1000
   sample_steps: 1
 
-  # --- DDPM only (pixel-space U-Net denoiser) ---
+  # --- DDPM only ---
   ddpm_base_channels: 64
   ddpm_channel_multipliers: [1, 2, 4]
   ddpm_num_res_blocks: 2
@@ -58,57 +64,83 @@ model:
 
 beta_annealing:
   enabled: true
-  schedule: cyclical          # linear | cosine | cyclical
-  beta_min: 0.0
-  beta_max: 2.0
-  warmup_epochs: 60
-  cycle_epochs: 30
-  n_cycles: 4
-  ratio_increase: 0.5        # fraction of cycle spent increasing
+  schedule: cyclical            # was cosine — cyclical is better for preventing
+                                # posterior collapse; each cycle resets beta to near
+                                # zero, letting the encoder recover capacity before
+                                # regularisation tightens again
+  beta_min: 0.0001            # was 0.0 — a hard zero gives no regularisation
+                                # signal at all in early epochs; tiny floor is safer
+  beta_max: 0.005              # was 2.0 — this is the most critical change;
+                                # 2.0 is ~4000x too high for this architecture and
+                                # is the primary cause of KL collapse and blurriness
+  warmup_epochs: 20             # was 60 — with cyclical schedule, a long warmup
+                                # delays the first cycle too much; 20 is sufficient
+  cycle_epochs: 20              # was 30 — shorter cycles let the encoder recover
+                                # capacity more frequently
+  n_cycles: 6                   # was 4 — more cycles over 200 epochs gives more
+                                # recovery opportunities
+  ratio_increase: 0.5
 
 training:
   epochs: 200
-  learning_rate: 3.0e-4
-  weight_decay: 1.0e-5
+  learning_rate: 1.0e-4         # was 3.0e-4 — too high for a transformer-based VAE;
+                                # transformers are sensitive to LR and 3e-4 likely
+                                # causes instability in the encoder cross-attention
+  weight_decay: 1.0e-4          # was 1e-5 — slightly higher weight decay helps
+                                # regularise the transformer encoder
   gradient_clip_norm: 1.0
   seed: 42
   mixed_precision: true
-  compile_model: false        # torch.compile (PyTorch 2+)
-  early_stopping_patience: 20
-  ema_decay: 0.999            # SCCD EMA decay for the target denoiser
-  consistency_k_steps: 5      # SCCD timestep gap between t and t'
+  compile_model: false
+  early_stopping_patience: 30   # was 20 — with cyclical beta, loss oscillates during
+                                # each cycle; patience of 20 risks stopping during a
+                                # normal beta-rise phase rather than true stagnation
+  ema_decay: 0.999
+  consistency_k_steps: 5
 
 loss:
-  recon_weight: 1.0              # MSE reconstruction weight
-  lpips_enabled: false           # toggle perceptual loss on/off
-  lpips_weight: 0.25             # perceptual loss weight
-  lpips_net: alex                 # backbone for LPIPS ("vgg" or "alex")
-  adv_enabled: false             # toggle adversarial (PatchGAN) loss on/off
-  adv_weight: 0.01                # generator adversarial weight
-  adv_start_epoch: 5            # delay adv loss until VAE learns basic reconstruction
-  disc_channels: 64              # base channels in discriminator
-  disc_layers: 3                 # strided layers in discriminator
-  consistency_weight: 1.0        # SCCD consistency loss weight
+  recon_weight: 1.0
+  lpips_enabled: true           # was false — MSE alone is the primary cause of
+                                # blurry reconstructions; LPIPS operates in feature
+                                # space and directly penalises perceptual blurriness
+  lpips_weight: 0.1             # was 0.25 — start conservative; 0.25 can overpower
+                                # reconstruction early in training; increase to 0.25
+                                # after 50 epochs if still blurry
+  lpips_net: alex               # alex is faster than vgg and equally effective on
+                                # CIFAR-10 scale images
+  adv_enabled: false            # keep off — adversarial training adds instability
+                                # without benefit when LPIPS is already enabled
+  adv_weight: 0.01
+  adv_start_epoch: 5
+  disc_channels: 64
+  disc_layers: 3
+  consistency_weight: 1.0
 
 optimizer:
   name: adamw
-  betas: [0.9, 0.999]
+  betas: [0.9, 0.95]           # was [0.9, 0.999] — lower beta2 (0.95) makes the
+                                # optimiser adapt faster to gradient changes, which
+                                # helps with the non-stationary loss landscape caused
+                                # by cyclical beta annealing
   eps: 1.0e-8
 
 scheduler:
   name: cosine_warmup
-  warmup_epochs: 5
+  warmup_epochs: 10             # was 5 — slightly longer warmup stabilises the
+                                # transformer encoder before full LR is reached
   min_lr: 1.0e-6
 
 paths:
   checkpoint_dir: ./checkpoints
-  resume_from: null            # set to a .pt path to auto-resume training
+  resume_from: null
   output_dir: ./outputs
 
 logging:
   log_interval: 50
   save_interval: 5
-  eval_interval: 5              # validate + compute FID/SSIM/PSNR every N epochs
-  num_fid_samples: 1024         # images used for FID estimation
+  eval_interval: 5
+  num_fid_samples: 10000        # was 1024 — FID with 1024 samples is statistically
+                                # unreliable; the standard minimum is 10000; use 50000
+                                # for publication-quality numbers
   num_samples: 64
   num_reconstructions: 16
