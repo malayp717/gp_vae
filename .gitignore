@@ -9,7 +9,6 @@ wheels/
 # Training artefacts
 checkpoints/
 outputs/
-data/cifar10/
 
 # IDE
 .vscode/
@@ -22,4 +21,4 @@ data/cifar10/
 Thumbs.db
 
 # Data
-data/
+/dataset/

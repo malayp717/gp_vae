@@ -24,7 +24,7 @@ class DataConfig:
     batch_size: int = 64
     num_workers: int = 4
     pin_memory: bool = True
-    data_dir: str = "./data/cifar10"
+    data_dir: str = "./dataset/cifar10"
     download: bool = True
     val_split: float = 0.1
 

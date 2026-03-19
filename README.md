@@ -15,6 +15,7 @@ The codebase supports:
 vae/
 ├── config/
 │   └── config.yaml
+├── dataset/                      # local dataset cache (gitignored)
 ├── src/
 │   └── vae/
 │       ├── cli/
@@ -70,6 +71,8 @@ Use `train_notebook.ipynb` to launch training from cells instead of the CLI.
 ## Configuration
 
 All runtime settings live in `config/config.yaml`. The loader now validates config structure through a typed schema in `src/vae/config/schema.py`.
+
+The default CIFAR-10 cache path is `dataset/cifar10/`, which is ignored by Git so it will not interfere with `src/vae/data/`.
 
 Key sections:
 
