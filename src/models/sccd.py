@@ -691,9 +691,12 @@ class SCCDModel(nn.Module):
 
         # Sample timestep pair (t, t′) with t > t′
         B = x.size(0)
-        t = torch.randint(1, self.schedule.T + 1, (B,), device=x.device)
+        # NOTE: schedule buffers are indexed in [0, T-1] (length = T).
+        # torch.randint upper-bound is exclusive, so this samples [1, T-1].
+        t = torch.randint(1, self.schedule.T, (B,), device=x.device)
         dt = torch.randint(1, k_steps + 1, (B,), device=x.device)
-        t_prime = (t - dt).clamp(min=0)
+        t = t.clamp(min=0, max=self.schedule.T - 1)
+        t_prime = (t - dt).clamp(min=0, max=self.schedule.T - 1)
 
         z_t = self.schedule.q_sample(z_hat, t, L)
         z_t_prime = self.schedule.q_sample(z_hat, t_prime, L)
@@ -778,14 +781,13 @@ class SCCDModel(nn.Module):
         if truncation is not None:
             z = z.clamp(-float(truncation), float(truncation))
 
-        T_buf = torch.full((n_samples,), self.schedule.T, device=device)
+        # schedule buffers are indexed in [0, T-1]
+        T_buf = torch.full((n_samples,), self.schedule.T - 1, device=device)
 
         if steps == 1:
             z0 = self.denoiser(z, T_buf, c)
         else:
-            ts = torch.linspace(
-                self.schedule.T, 0, steps + 1, device=device
-            ).long()
+            ts = torch.linspace(self.schedule.T - 1, 0, steps + 1, device=device).long()
             for i in range(steps):
                 t_cur = ts[i].expand(n_samples)
                 z0 = self.denoiser(z, t_cur, c)
