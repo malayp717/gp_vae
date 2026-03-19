@@ -103,6 +103,14 @@ class VAELoss(nn.Module):
         if self._discriminator is not None:
             yield from self._discriminator.parameters()
 
+    def _cast_for_discriminator(self, x: torch.Tensor) -> torch.Tensor:
+        if self._discriminator is None:
+            return x
+        ref_param = next(self._discriminator.parameters(), None)
+        if ref_param is None:
+            return x
+        return x.to(device=ref_param.device, dtype=ref_param.dtype)
+
     def set_epoch(self, epoch: int) -> None:
         self._current_epoch = epoch
 
@@ -134,7 +142,7 @@ class VAELoss(nn.Module):
     def generator_adv_loss(self, recon: torch.Tensor) -> torch.Tensor:
         if self._discriminator is None:
             return torch.tensor(0.0, device=recon.device)
-        fake_logits = self._discriminator(recon)
+        fake_logits = self._discriminator(self._cast_for_discriminator(recon))
         return -fake_logits.clamp(-50.0, 50.0).mean()
 
     def discriminator_loss(
@@ -143,8 +151,8 @@ class VAELoss(nn.Module):
         real: torch.Tensor,
     ) -> torch.Tensor:
         assert self._discriminator is not None, "No discriminator to train"
-        real_logits = self._discriminator(real).clamp(-50.0, 50.0)
-        fake_logits = self._discriminator(recon_detached).clamp(-50.0, 50.0)
+        real_logits = self._discriminator(self._cast_for_discriminator(real)).clamp(-50.0, 50.0)
+        fake_logits = self._discriminator(self._cast_for_discriminator(recon_detached)).clamp(-50.0, 50.0)
         return 0.5 * (F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean())
 
     def forward(
