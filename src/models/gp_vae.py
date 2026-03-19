@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vae.losses.kl import low_rank_kl_per_dim
+from src.losses.kl import low_rank_kl_per_dim
 
 
 class LatentRefinement(nn.Module):

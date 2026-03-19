@@ -1,8 +1,8 @@
 # GP-VAE (Generalized Posterior VAE) — Technical Notes
 
 This document describes the current GP-VAE implementation in
-`src/vae/models/gp_vae.py` and the structured-KL helpers in
-`src/vae/losses/kl.py`.
+`src/models/gp_vae.py` and the structured-KL helpers in
+`src/losses/kl.py`.
 
 The current architecture is a patch-latent VAE with:
 
@@ -38,8 +38,8 @@ vector for the whole image.
 
 ## Source locations
 
-- Model class: `src/vae/models/gp_vae.py`
-- Structured KL math: `src/vae/losses/kl.py`
+- Model class: `src/models/gp_vae.py`
+- Structured KL math: `src/losses/kl.py`
 
 Main class:
 
@@ -155,7 +155,7 @@ The implementation uses the matrix determinant lemma:
 so the expensive determinant is reduced to a `k x k` matrix instead of a
 `d x d` one.
 
-This logic now lives in `src/vae/losses/kl.py`, not inside the model module.
+This logic now lives in `src/losses/kl.py`, not inside the model module.
 
 ### Per-image KL aggregation in this implementation
 

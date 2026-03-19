@@ -10,12 +10,12 @@ import torch
 from torch.amp import autocast
 from torchvision.utils import make_grid, save_image
 
-from vae.config.loader import load_config
-from vae.data import get_cifar10_dataloaders
-from vae.latent import slerp
-from vae.models.base import encode_latent_mean
-from vae.runtime import get_device, get_model_type
-from vae.training.checkpoints import load_model_from_checkpoint
+from src.config.loader import load_config
+from src.data import get_cifar10_dataloaders
+from src.latent import slerp
+from src.models.base import encode_latent_mean
+from src.runtime import get_device, get_model_type
+from src.training.checkpoints import load_model_from_checkpoint
 
 logger = logging.getLogger(__name__)
 

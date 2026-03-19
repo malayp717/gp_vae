@@ -8,9 +8,9 @@ import torch
 from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 
-from vae.losses import VAELoss
-from vae.models import get_kl_override
-from vae.training.beta_schedule import BetaScheduler
+from src.losses import VAELoss
+from src.models import get_kl_override
+from src.training.beta_schedule import BetaScheduler
 
 from .evaluation import evaluate_loader
 

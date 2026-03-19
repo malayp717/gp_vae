@@ -10,7 +10,7 @@ import yaml
 
 from .schema import ExperimentConfig
 
-_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "config.yaml"
+_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "config.yaml"
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -32,7 +32,7 @@ def load_typed_config(
     path = Path(config_path) if config_path is not None else _DEFAULT_CONFIG_PATH
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         raw: dict[str, Any] = yaml.safe_load(fh) or {}
     if overrides:
         raw = _deep_merge(raw, overrides)

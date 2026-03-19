@@ -8,8 +8,8 @@ from typing import Any
 
 import torch
 
-from vae.models import build_model
-from vae.runtime.device import get_device
+from src.models import build_model
+from src.runtime.device import get_device
 
 logger = logging.getLogger(__name__)
 

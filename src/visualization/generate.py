@@ -6,8 +6,8 @@ from pathlib import Path
 
 import torch
 
-from vae.config.loader import load_config
-from vae.pipelines import get_pipeline_family
+from src.config.loader import load_config
+from src.pipelines import get_pipeline_family
 
 
 def _resolve_model_type(
@@ -31,7 +31,7 @@ def generate_samples(
     model_type = _resolve_model_type(checkpoint_path, config_path)
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.generation import generate_samples as diffusion_generate_samples
+        from src.pipelines.diffusion.generation import generate_samples as diffusion_generate_samples
 
         return diffusion_generate_samples(
             checkpoint_path=checkpoint_path,
@@ -40,7 +40,7 @@ def generate_samples(
             output_dir=output_dir,
         )
 
-    from vae.pipelines.vae.generation import generate_samples as vae_generate_samples
+    from src.pipelines.vae.generation import generate_samples as vae_generate_samples
 
     return vae_generate_samples(
         checkpoint_path=checkpoint_path,
@@ -59,7 +59,7 @@ def generate_reconstructions(
     model_type = _resolve_model_type(checkpoint_path, config_path)
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.generation import generate_reconstructions as diffusion_generate_reconstructions
+        from src.pipelines.diffusion.generation import generate_reconstructions as diffusion_generate_reconstructions
 
         return diffusion_generate_reconstructions(
             checkpoint_path=checkpoint_path,
@@ -68,7 +68,7 @@ def generate_reconstructions(
             output_dir=output_dir,
         )
 
-    from vae.pipelines.vae.generation import generate_reconstructions as vae_generate_reconstructions
+    from src.pipelines.vae.generation import generate_reconstructions as vae_generate_reconstructions
 
     return vae_generate_reconstructions(
         checkpoint_path=checkpoint_path,
@@ -88,7 +88,7 @@ def generate_interpolations(
     model_type = _resolve_model_type(checkpoint_path, config_path)
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.generation import generate_interpolations as diffusion_generate_interpolations
+        from src.pipelines.diffusion.generation import generate_interpolations as diffusion_generate_interpolations
 
         return diffusion_generate_interpolations(
             checkpoint_path=checkpoint_path,
@@ -98,7 +98,7 @@ def generate_interpolations(
             output_dir=output_dir,
         )
 
-    from vae.pipelines.vae.generation import generate_interpolations as vae_generate_interpolations
+    from src.pipelines.vae.generation import generate_interpolations as vae_generate_interpolations
 
     return vae_generate_interpolations(
         checkpoint_path=checkpoint_path,

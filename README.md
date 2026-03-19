@@ -1,6 +1,6 @@
 # Beta-VAE, GP-VAE, SCCD, and DDPM
 
-Research-style generative modeling code for CIFAR-10 with a package-first layout under `src/vae`.
+Research-style generative modeling code for CIFAR-10 with a package-first layout under `src/`.
 
 The codebase supports:
 
@@ -27,7 +27,7 @@ vae/
 │   └── config.yaml
 ├── dataset/                      # local dataset cache (gitignored)
 ├── src/
-│   └── vae/
+│   └── src/
 │       ├── cli/
 │       ├── config/
 │       ├── data/
@@ -74,7 +74,7 @@ python main.py test --mode all
 python main.py run-all
 
 # alternatively, run the package CLI directly
-python src/vae/cli/app.py train
+python src/cli/app.py train
 ```
 
 `python main.py train --model sccd` and `python main.py train --model ddpm` use the diffusion pipeline automatically, while `vae` and `gp_vae` use the VAE pipeline.
@@ -89,9 +89,9 @@ Use `train_notebook.ipynb` to launch training from cells instead of the CLI.
 
 ## Configuration
 
-All runtime settings live in `config/config.yaml`. The loader now validates config structure through a typed schema in `src/vae/config/schema.py`.
+All runtime settings live in `config/config.yaml`. The loader now validates config structure through a typed schema in `src/config/schema.py`.
 
-The default CIFAR-10 cache path is `dataset/cifar10/`, which is ignored by Git so it will not interfere with `src/vae/data/`.
+The default CIFAR-10 cache path is `dataset/cifar10/`, which is ignored by Git so it will not interfere with `src/data/`.
 
 Key sections:
 
@@ -119,7 +119,7 @@ For each model type, outputs are written to:
 
 ## Notes
 
-- Runtime code lives in `src/vae`. The root `main.py` only bootstraps `src/` onto `sys.path` and forwards into the package CLI.
+- Runtime code lives in `src/`. The root `main.py` forwards into the package CLI.
 - `sccd` and `ddpm` are treated as diffusion-family models. `sccd` uses structured latent diffusion / consistency training, while `ddpm` uses pure denoising loss in pixel space.
 - `patch_vae` and `patch_transformer_vae` are not supported runtime model types; the supported values are `vae`, `gp_vae`, `sccd`, and `ddpm`.
 - Smoke tests can be run with `python -m unittest discover -s tests`.

@@ -7,16 +7,15 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from vae.cli.app import build_overrides
-from vae.config.loader import load_config, load_typed_config
-from vae.models.factory import build_model
-from vae.pipelines import get_pipeline_family
-from vae.training.beta_schedule import BetaScheduler
-from vae.training.checkpoints import latest_checkpoint_path, periodic_checkpoint_path
+from src.cli.app import build_overrides
+from src.config.loader import load_config, load_typed_config
+from src.models.factory import build_model
+from src.pipelines import get_pipeline_family
+from src.training.beta_schedule import BetaScheduler
+from src.training.checkpoints import latest_checkpoint_path, periodic_checkpoint_path
 
 
 class RefactorSmokeTests(unittest.TestCase):

@@ -10,14 +10,14 @@ from pathlib import Path
 import torch
 
 if __package__ in {None, ""}:
-    SRC = Path(__file__).resolve().parents[2]
-    if str(SRC) not in sys.path:
-        sys.path.insert(0, str(SRC))
+    ROOT = Path(__file__).resolve().parents[2]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
-from vae.config.loader import load_config
-from vae.pipelines import get_pipeline_family
-from vae.runtime.paths import get_model_type
-from vae.training.checkpoints import latest_checkpoint_path
+from src.config.loader import load_config
+from src.pipelines import get_pipeline_family
+from src.runtime.paths import get_model_type
+from src.training.checkpoints import latest_checkpoint_path
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     model_type = resolve_model_type(args.config, model_override=getattr(args, "model", None))
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.engine import train as diffusion_train
+        from src.pipelines.diffusion.engine import train as diffusion_train
 
         diffusion_train(
             config_path=args.config,
@@ -90,7 +90,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         )
         return
 
-    from vae.pipelines.vae.engine import train as vae_train
+    from src.pipelines.vae.engine import train as vae_train
 
     vae_train(
         config_path=args.config,
@@ -104,12 +104,12 @@ def cmd_validate(args: argparse.Namespace) -> None:
     model_type = resolve_model_type(args.config, checkpoint)
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.evaluation import run_validation as diffusion_run_validation
+        from src.pipelines.diffusion.evaluation import run_validation as diffusion_run_validation
 
         diffusion_run_validation(checkpoint_path=checkpoint, config_path=args.config, split=args.split)
         return
 
-    from vae.pipelines.vae.evaluation import run_validation as vae_run_validation
+    from src.pipelines.vae.evaluation import run_validation as vae_run_validation
 
     vae_run_validation(checkpoint_path=checkpoint, config_path=args.config, split=args.split)
 
@@ -119,13 +119,13 @@ def cmd_test(args: argparse.Namespace) -> None:
     model_type = resolve_model_type(args.config, checkpoint)
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.generation import (
+        from src.pipelines.diffusion.generation import (
             generate_interpolations,
             generate_reconstructions,
             generate_samples,
         )
     else:
-        from vae.pipelines.vae.generation import (
+        from src.pipelines.vae.generation import (
             generate_interpolations,
             generate_reconstructions,
             generate_samples,
@@ -144,17 +144,17 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     model_type = resolve_model_type(args.config, model_override=getattr(args, "model", None))
     family = get_pipeline_family(model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.engine import train as pipeline_train
-        from vae.pipelines.diffusion.evaluation import run_validation as pipeline_run_validation
-        from vae.pipelines.diffusion.generation import (
+        from src.pipelines.diffusion.engine import train as pipeline_train
+        from src.pipelines.diffusion.evaluation import run_validation as pipeline_run_validation
+        from src.pipelines.diffusion.generation import (
             generate_interpolations,
             generate_reconstructions,
             generate_samples,
         )
     else:
-        from vae.pipelines.vae.engine import train as pipeline_train
-        from vae.pipelines.vae.evaluation import run_validation as pipeline_run_validation
-        from vae.pipelines.vae.generation import (
+        from src.pipelines.vae.engine import train as pipeline_train
+        from src.pipelines.vae.evaluation import run_validation as pipeline_run_validation
+        from src.pipelines.vae.generation import (
             generate_interpolations,
             generate_reconstructions,
             generate_samples,

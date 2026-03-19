@@ -6,11 +6,11 @@ from pathlib import Path
 
 import torch
 
-from vae.config.loader import load_config
-from vae.pipelines import get_pipeline_family
-from vae.training.checkpoints import load_model_from_checkpoint
+from src.config.loader import load_config
+from src.pipelines import get_pipeline_family
+from src.training.checkpoints import load_model_from_checkpoint
 
-from vae.pipelines.vae.evaluation import evaluate_loader, evaluate_per_class
+from src.pipelines.vae.evaluation import evaluate_loader, evaluate_per_class
 
 
 def run_validation(
@@ -30,11 +30,11 @@ def run_validation(
 
     family = get_pipeline_family(checkpoint_model_type)
     if family == "diffusion":
-        from vae.pipelines.diffusion.evaluation import run_validation as diffusion_run_validation
+        from src.pipelines.diffusion.evaluation import run_validation as diffusion_run_validation
 
         return diffusion_run_validation(checkpoint_path=checkpoint_path, config_path=config_path, split=split)
 
-    from vae.pipelines.vae.evaluation import run_validation as vae_run_validation
+    from src.pipelines.vae.evaluation import run_validation as vae_run_validation
 
     return vae_run_validation(checkpoint_path=checkpoint_path, config_path=config_path, split=split)
 

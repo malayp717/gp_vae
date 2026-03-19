@@ -14,12 +14,12 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
 from tqdm.auto import tqdm
 
-from vae.config.loader import load_config
-from vae.data import get_cifar10_dataloaders
-from vae.losses import VAELoss, diagonal_kl_per_dim
-from vae.models import get_kl_override, get_kl_per_dim
-from vae.runtime import get_device
-from vae.training.checkpoints import load_model_from_checkpoint
+from src.config.loader import load_config
+from src.data import get_cifar10_dataloaders
+from src.losses import VAELoss, diagonal_kl_per_dim
+from src.models import get_kl_override, get_kl_per_dim
+from src.runtime import get_device
+from src.training.checkpoints import load_model_from_checkpoint
 
 logger = logging.getLogger(__name__)
 

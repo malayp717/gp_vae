@@ -1,4 +1,4 @@
-"""Top-level training engine for VAE-family models."""
+"""Top-level training engine for diffusion-family models."""
 
 from __future__ import annotations
 
@@ -11,21 +11,20 @@ import torch
 from torch.amp import GradScaler
 from torch.optim import AdamW
 
-from vae.config.loader import load_config
-from vae.evaluation.image_metrics import compute_image_metrics
-from vae.losses import VAELoss
-from vae.models import build_model
-from vae.reporting import DIVIDER, HEADER, append_train_stats, append_val_stats, fmt_row
-from vae.runtime import get_device, get_run_output_dir, seed_everything
-from vae.training.beta_schedule import BetaScheduler
-from vae.training.checkpoints import load_training_state, periodic_checkpoint_path, save_checkpoint
-from vae.training.lr_schedulers import build_cosine_warmup_scheduler
-from vae.visualization.latent_kl import save_kl_per_dim_artifacts
+from src.config.loader import load_config
+from src.data import get_cifar10_dataloaders
+from src.losses import VAELoss
+from src.models import build_model
+from src.runtime import get_device, get_run_output_dir, seed_everything
+from src.training.beta_schedule import BetaScheduler
+from src.training.checkpoints import load_training_state, periodic_checkpoint_path, save_checkpoint
+from src.training.lr_schedulers import build_cosine_warmup_scheduler
+from src.visualization.latent_kl import save_kl_per_dim_artifacts
 
-from .evaluation import evaluate_loader
+from .evaluation import compute_image_metrics
+from .generation import save_validation_images
 from .loops import train_one_epoch, validate_one_epoch
-from .reconstructions import save_validation_images
-from vae.data import get_cifar10_dataloaders
+from .reporting import DIVIDER, HEADER, append_train_stats, append_val_stats, fmt_row
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ def train(
     resume_from: str | Path | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> Path:
-    """Run full VAE-family training and return the latest checkpoint path."""
+    """Run full diffusion-family training and return the latest checkpoint path."""
     config = load_config(config_path, overrides=config_overrides)
     model_cfg = config["model"]
     train_cfg = config["training"]
@@ -43,12 +42,13 @@ def train(
     sched_cfg = config.get("scheduler", {})
     paths_cfg = config["paths"]
     log_cfg = config.get("logging", {})
+    loss_cfg = config.get("loss", {})
 
     seed_everything(train_cfg.get("seed", 42))
     device = get_device()
     logger.info("Device: %s", device)
 
-    model_type = model_cfg.get("type", "vae")
+    model_type = model_cfg.get("type", "sccd")
     logger.info("Model type: %s", model_type)
 
     checkpoint_dir = Path(paths_cfg.get("checkpoint_dir", "./checkpoints"))
@@ -85,20 +85,35 @@ def train(
         base_lr=train_cfg.get("learning_rate", 3e-4),
     )
     beta_scheduler = BetaScheduler(config)
-    criterion = VAELoss.from_config(config, device)
-    logger.info(
-        "Loss config: recon=%.3f | lpips=%s (w=%.3f, net=%s) | adv=%s (w=%.3f, start=%d)",
-        float(criterion.recon_weight),
-        "on" if criterion.lpips_enabled and criterion.lpips_weight > 0 else "off",
-        float(criterion.lpips_weight),
-        config.get("loss", {}).get("lpips_net", "vgg"),
-        "on" if criterion.has_discriminator and criterion.adv_weight > 0 else "off",
-        float(criterion.adv_weight),
-        int(criterion.adv_start_epoch),
-    )
+    consistency_weight = float(loss_cfg.get("consistency_weight", 1.0))
+    consistency_k_steps = int(train_cfg.get("consistency_k_steps", 5))
+    ema_decay = float(train_cfg.get("ema_decay", 0.999))
+    if model_type == "ddpm":
+        sample_steps = int(model_cfg.get("ddpm_sample_steps", model_cfg.get("diffusion_T", 1000)))
+        criterion = None
+        logger.info(
+            "Loss config: ddpm_denoising | beta_schedule=%s | T=%d | sample_steps=%d",
+            model_cfg.get("ddpm_beta_schedule", "linear"),
+            int(model_cfg.get("diffusion_T", 1000)),
+            sample_steps,
+        )
+    else:
+        sample_steps = int(model_cfg.get("sample_steps", 1))
+        criterion = VAELoss.from_config(config, device)
+        logger.info(
+            "Loss config: recon=%.3f | consistency=%.3f | lpips=%s (w=%.3f, net=%s) | adv=%s (w=%.3f, start=%d)",
+            float(criterion.recon_weight),
+            consistency_weight,
+            "on" if criterion.lpips_enabled and criterion.lpips_weight > 0 else "off",
+            float(criterion.lpips_weight),
+            config.get("loss", {}).get("lpips_net", "vgg"),
+            "on" if criterion.has_discriminator and criterion.adv_weight > 0 else "off",
+            float(criterion.adv_weight),
+            int(criterion.adv_start_epoch),
+        )
 
     disc_optimizer: torch.optim.Optimizer | None = None
-    if criterion.has_discriminator:
+    if criterion is not None and criterion.has_discriminator:
         disc_optimizer = AdamW(
             criterion.discriminator_params(),
             lr=train_cfg.get("learning_rate", 3e-4),
@@ -133,6 +148,7 @@ def train(
     eval_interval = log_cfg.get("eval_interval", 5)
     num_fid_samples = log_cfg.get("num_fid_samples", 1024)
     patience = train_cfg.get("early_stopping_patience", 20)
+    num_classes = int(model_cfg.get("num_classes", 10)) if model_type == "sccd" else None
 
     epochs_without_improvement = 0
     latest_ckpt_path: Path | None = None
@@ -143,9 +159,11 @@ def train(
     t_start = time.perf_counter()
 
     for epoch in range(start_epoch, epochs):
-        criterion.set_epoch(epoch)
+        if criterion is not None:
+            criterion.set_epoch(epoch)
         train_metrics, last_beta = train_one_epoch(
             model,
+            model_type,
             train_loader,
             optimizer,
             beta_scheduler,
@@ -155,6 +173,9 @@ def train(
             grad_clip,
             use_amp,
             criterion=criterion,
+            consistency_weight=consistency_weight,
+            consistency_k_steps=consistency_k_steps,
+            ema_decay=ema_decay,
             disc_optimizer=disc_optimizer,
         )
         lr_scheduler.step()
@@ -168,6 +189,7 @@ def train(
                 train_metrics["loss"],
                 train_metrics["recon_loss"],
                 train_metrics["kl_loss"],
+                diffusion_loss=train_metrics["diffusion_loss"],
                 lpips_val=train_metrics["lpips_loss"],
                 adv_g=train_metrics["adv_g_loss"],
                 d_loss=train_metrics["d_loss"],
@@ -178,19 +200,40 @@ def train(
         append_train_stats(train_log_path, model_type, epoch, epochs, train_metrics, beta=last_beta)
 
         if (epoch + 1) % eval_interval == 0:
-            beta = beta_scheduler(epoch)
+            beta = beta_scheduler(epoch) if model_type == "sccd" else 0.0
             val_metrics, kl_per_dim = validate_one_epoch(
                 model,
+                model_type,
                 val_loader,
                 device,
                 beta,
                 use_amp,
                 criterion=criterion,
+                consistency_weight=consistency_weight,
+                consistency_k_steps=consistency_k_steps,
             )
-            img_metrics = compute_image_metrics(model, val_loader, device, num_fid_samples=num_fid_samples)
+            img_metrics = compute_image_metrics(
+                model,
+                model_type,
+                val_loader,
+                device,
+                num_classes=num_classes,
+                num_fid_samples=num_fid_samples,
+                sample_steps=sample_steps,
+            )
 
-            save_validation_images(model, val_loader, device, epoch, model_type, run_output_dir, use_amp)
-            if kl_per_dim is not None:
+            save_validation_images(
+                model,
+                val_loader,
+                device,
+                epoch,
+                model_type,
+                run_output_dir,
+                use_amp,
+                num_classes=num_classes or 0,
+                steps=sample_steps,
+            )
+            if kl_per_dim is not None and model_type == "sccd":
                 save_kl_per_dim_artifacts(kl_per_dim, model_type, epoch, logs_dir)
 
             if val_metrics["loss"] < best_val_loss:
@@ -207,6 +250,7 @@ def train(
                     val_metrics["loss"],
                     val_metrics["recon_loss"],
                     val_metrics["kl_loss"],
+                    diffusion_loss=val_metrics["diffusion_loss"],
                     lpips_val=val_metrics["lpips_loss"],
                     adv_g=val_metrics.get("adv_g_loss", 0.0),
                     d_loss=val_metrics.get("d_loss", 0.0),

@@ -10,13 +10,13 @@ import torch
 from torch.amp import autocast
 from tqdm.auto import tqdm
 
-from vae.config.loader import load_config
-from vae.data import CIFAR10_CLASSES, get_cifar10_dataloaders
-from vae.evaluation.image_metrics import compute_image_metrics
-from vae.losses import VAELoss, diagonal_kl_per_dim
-from vae.models import get_kl_override, get_kl_per_dim
-from vae.runtime import get_device
-from vae.training.checkpoints import load_model_from_checkpoint
+from src.config.loader import load_config
+from src.data import CIFAR10_CLASSES, get_cifar10_dataloaders
+from src.evaluation.image_metrics import compute_image_metrics
+from src.losses import VAELoss, diagonal_kl_per_dim
+from src.models import get_kl_override, get_kl_per_dim
+from src.runtime import get_device
+from src.training.checkpoints import load_model_from_checkpoint
 
 logger = logging.getLogger(__name__)
 

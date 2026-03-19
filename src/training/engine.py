@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from vae.config.loader import load_config
-from vae.pipelines import get_pipeline_family
+from src.config.loader import load_config
+from src.pipelines import get_pipeline_family
 
 
 def train(
@@ -20,7 +20,7 @@ def train(
     family = get_pipeline_family(model_type)
 
     if family == "diffusion":
-        from vae.pipelines.diffusion.engine import train as diffusion_train
+        from src.pipelines.diffusion.engine import train as diffusion_train
 
         return diffusion_train(
             config_path=config_path,
@@ -28,7 +28,7 @@ def train(
             config_overrides=config_overrides,
         )
 
-    from vae.pipelines.vae.engine import train as vae_train
+    from src.pipelines.vae.engine import train as vae_train
 
     return vae_train(
         config_path=config_path,
