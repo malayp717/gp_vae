@@ -8,6 +8,13 @@ _LOG_SIGMA_CLAMP = 10.0
 _EPS = 1e-6
 
 
+def _kl_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Promote low-precision tensors for numerically sensitive KL algebra."""
+    if dtype in {torch.float16, torch.bfloat16}:
+        return torch.float32
+    return dtype
+
+
 def diagonal_kl_per_dim(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
     """Return mean KL contribution for each latent dimension."""
     mu_flat = mu.reshape(-1, mu.shape[-1])
@@ -17,6 +24,11 @@ def diagonal_kl_per_dim(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor
 
 def low_rank_kl(mu: torch.Tensor, log_sigma: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """KL(q||p) where q has diagonal+low-rank covariance and p is N(0, I)."""
+    compute_dtype = _kl_compute_dtype(mu.dtype)
+    mu = mu.to(dtype=compute_dtype)
+    log_sigma = log_sigma.to(dtype=compute_dtype)
+    V = V.to(dtype=compute_dtype)
+
     _, dim = mu.shape
     rank = V.shape[2]
 
@@ -47,6 +59,11 @@ def low_rank_kl_per_dim(
     eps: float = _EPS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return total and per-dimension KL for a diagonal+low-rank posterior."""
+    compute_dtype = _kl_compute_dtype(mu.dtype)
+    mu = mu.to(dtype=compute_dtype)
+    log_sigma = log_sigma.to(dtype=compute_dtype)
+    V = V.to(dtype=compute_dtype)
+
     _, dim = mu.shape
     rank = V.shape[2]
 

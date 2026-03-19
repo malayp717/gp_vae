@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+import os
 import warnings
+from pathlib import Path
 from typing import Any, Iterator
 
 import lpips as _lpips_lib
@@ -11,6 +14,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .adversarial import PatchDiscriminator
+
+
+def _default_lpips_weights_path(net: str, version: str = "0.1") -> Path:
+    lpips_init = inspect.getfile(_lpips_lib.LPIPS.__init__)
+    return Path(os.path.abspath(os.path.join(lpips_init, "..", f"weights/v{version}/{net}.pth")))
+
+
+def _safe_load_state_dict(path: Path) -> dict[str, torch.Tensor]:
+    load_kwargs: dict[str, Any] = {"map_location": "cpu"}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = True
+    state = torch.load(path, **load_kwargs)
+    if not isinstance(state, dict):
+        raise TypeError(f"Expected LPIPS weights at {path} to be a state dict, got {type(state)!r}")
+    return state
+
+
+def _build_lpips(net: str, device: torch.device | str) -> _lpips_lib.LPIPS:
+    with warnings.catch_warnings():
+        # LPIPS still constructs torchvision backbones with deprecated args internally.
+        warnings.filterwarnings(
+            "ignore",
+            message=r"The parameter 'pretrained' is deprecated since 0\.13.*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Arguments other than a weight enum or `None` for 'weights' are deprecated since 0\.13.*",
+            category=UserWarning,
+        )
+        lpips_model = _lpips_lib.LPIPS(net=net, pretrained=False, verbose=False, eval_mode=False)
+
+    state_dict = _safe_load_state_dict(_default_lpips_weights_path(net))
+    lpips_model.load_state_dict(state_dict, strict=False)
+    return lpips_model.to(device)
 
 
 class VAELoss(nn.Module):
@@ -36,19 +74,7 @@ class VAELoss(nn.Module):
         self.lpips_weight = lpips_weight if lpips_enabled else 0.0
         self._lpips_fn: _lpips_lib.LPIPS | None = None
         if lpips_enabled and lpips_weight > 0:
-            with warnings.catch_warnings():
-                # LPIPS still constructs torchvision backbones with deprecated args internally.
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"The parameter 'pretrained' is deprecated since 0\.13.*",
-                    category=UserWarning,
-                )
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"Arguments other than a weight enum or `None` for 'weights' are deprecated since 0\.13.*",
-                    category=UserWarning,
-                )
-                self._lpips_fn = _lpips_lib.LPIPS(net=lpips_net).to(device)
+            self._lpips_fn = _build_lpips(lpips_net, device)
             self._lpips_fn.eval()
             for param in self._lpips_fn.parameters():
                 param.requires_grad = False
