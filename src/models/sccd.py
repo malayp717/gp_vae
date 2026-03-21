@@ -1,751 +1,642 @@
-"""Structured-Covariance Consistency Diffusion (SCCD).
-
-Combines a GP-VAE-style encoder/decoder backbone with a consistency-distilled
-Diffusion Transformer denoiser. The model file owns only the SCCD model
-definition and its runtime primitives; training, evaluation, and CLI routing
-live in the diffusion pipeline modules.
-"""
+"""Structured-Covariance Patch Diffusion Transformer (SC-PDT) as `sccd`."""
 
 from __future__ import annotations
 
-import copy
 import math
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.losses.kl import low_rank_kl_per_dim
-from src.models.base import SupportsVAEAPI
-
-
-# ---------------------------------------------------------------------------
-# Noise schedule
-# ---------------------------------------------------------------------------
 
 class CosineNoiseSchedule(nn.Module):
-    """Cosine beta schedule (Nichol & Dhariwal, 2021).
-
-    Buffers (not parameters – never trained):
-        alphas_bar : cumulative product ᾱ_t,  shape (T,)
-    """
+    """Cosine noise schedule (Nichol & Dhariwal, 2021)."""
 
     def __init__(self, T: int = 1000, s: float = 0.008) -> None:
         super().__init__()
-        steps = T + 1
-        t = torch.linspace(0, T, steps) / T
-        alphas_cumprod = torch.cos((t + s) / (1.0 + s) * math.pi / 2.0) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = (1.0 - alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(0.0, 0.9999)
-        self.register_buffer("alphas_bar", torch.cumprod(1.0 - betas, dim=0))
-        self.T = T
+        self.T = int(T)
+
+        steps = torch.arange(T + 1, dtype=torch.float64)
+        f = torch.cos((steps / T + s) / (1.0 + s) * (math.pi / 2.0)) ** 2
+        alphas_cumprod = f / f[0]
+        betas = (1.0 - alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(max=0.999)
+
+        self.register_buffer("betas", betas.float(), persistent=False)
+        self.register_buffer("alphas", (1.0 - betas).float(), persistent=False)
+        self.register_buffer("alphas_cumprod", alphas_cumprod[:-1].float(), persistent=False)
+        self.register_buffer(
+            "sqrt_alphas_cumprod",
+            torch.sqrt(alphas_cumprod[:-1]).float(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sqrt_one_minus_alphas_cumprod",
+            torch.sqrt(1.0 - alphas_cumprod[:-1]).float(),
+            persistent=False,
+        )
 
     def q_sample(
         self,
-        z0: torch.Tensor,
+        x0: torch.Tensor,
         t: torch.Tensor,
-        L: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Structured forward process.
-
-        z_t = √ᾱ_t · z0 + √(1−ᾱ_t) · L ε,   ε ~ N(0, I)
-
-        Args:
-            z0: Clean latents  (B, N, d).
-            t:  Timestep indices  (B,).
-            L:  Cholesky factor (B, N, d, d).  If None, uses isotropic noise.
-
-        Returns:
-            z_t: Noisy latents  (B, N, d).
-        """
-        ab = self.alphas_bar[t][:, None, None]          # (B, 1, 1)
-        eps = torch.randn_like(z0)                       # (B, N, d)
-        if L is not None:
-            eps = torch.einsum("bnij,bnj->bni", L, eps) # structured noise
-        return ab.sqrt() * z0 + (1.0 - ab).sqrt() * eps
+        """Forward process q(x_t | x_0)."""
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t]
+        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t]
+        while sqrt_alpha.dim() < x0.dim():
+            sqrt_alpha = sqrt_alpha.unsqueeze(-1)
+            sqrt_one_minus = sqrt_one_minus.unsqueeze(-1)
+        return sqrt_alpha * x0 + sqrt_one_minus * noise
 
 
-# ---------------------------------------------------------------------------
-# Encoder sub-modules  (mirrors gp_vae.py style)
-# ---------------------------------------------------------------------------
-
-def _make_patch_cnn(
-    in_channels: int,
-    channels: Sequence[int],
-    use_bn: bool = True,
-) -> nn.Sequential:
-    """Strided CNN that encodes a single patch to a feature vector."""
-    layers: list[nn.Module] = []
-    current = in_channels
-    for ch in channels:
-        layers.append(nn.Conv2d(current, ch, 3, padding=1))
-        if use_bn:
-            layers.append(nn.BatchNorm2d(ch))
-        layers.append(nn.GELU())
-        layers.append(nn.MaxPool2d(2))
-        current = ch
-    return nn.Sequential(*layers)
-
-
-class _LatentRefinement(nn.Module):
-    """Windowed self-attention refinement over patch latents (from gp_vae.py)."""
-
-    def __init__(
-        self,
-        latent_dim: int,
-        heads: int = 4,
-        layers: int = 2,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        block = nn.TransformerEncoderLayer(
-            d_model=latent_dim,
-            nhead=heads,
-            dim_feedforward=latent_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            block, layers, enable_nested_tensor=False
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.transformer(z)
-
-
-# ---------------------------------------------------------------------------
-# Decoder sub-modules  (mirrors gp_vae.py style)
-# ---------------------------------------------------------------------------
-
-class _PatchTokenDecoder(nn.Module):
-    """Decode a single latent token into a patch image (from gp_vae.py)."""
-
-    def __init__(
-        self,
-        token_dim: int,
-        hidden_channels: Sequence[int],
-        out_channels: int,
-        patch_size: int,
-    ) -> None:
-        super().__init__()
-        if not hidden_channels:
-            raise ValueError("hidden_channels must be non-empty")
-        self.patch_size = int(patch_size)
-        n_ups = max(len(hidden_channels) - 1, 0)
-        self._init_channels = int(hidden_channels[0])
-        self._init_size = max(1, self.patch_size // (2 ** max(n_ups, 1)))
-        self.fc = nn.Linear(
-            token_dim,
-            self._init_channels * self._init_size * self._init_size,
-        )
-        layers: list[nn.Module] = []
-        channels_in = self._init_channels
-        for channels_out in hidden_channels[1:]:
-            layers.append(
-                nn.ConvTranspose2d(channels_in, channels_out, 4, stride=2, padding=1)
-            )
-            layers.append(nn.GELU())
-            channels_in = channels_out
-        layers.append(nn.Conv2d(channels_in, out_channels, 3, padding=1))
-        self.deconv = nn.Sequential(*layers)
-
-    def forward(self, token: torch.Tensor) -> torch.Tensor:
-        hidden = self.fc(token)
-        hidden = hidden.view(
-            -1, self._init_channels, self._init_size, self._init_size
-        )
-        hidden = self.deconv(hidden)
-        if hidden.shape[-1] != self.patch_size:
-            hidden = F.interpolate(
-                hidden,
-                size=(self.patch_size, self.patch_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-        return hidden
-
-
-def _build_seam_mask(
-    image_size: int, patch_size: int, width: int = 2
-) -> torch.Tensor:
-    """Binary mask marking patch boundaries (from gp_vae.py)."""
-    mask = torch.zeros(1, 1, image_size, image_size, dtype=torch.float32)
-    grid = image_size // patch_size
-    width = max(1, int(width))
-    for idx in range(1, grid):
-        pos = idx * patch_size
-        y0, y1 = max(pos - width, 0), min(pos + width, image_size)
-        x0, x1 = max(pos - width, 0), min(pos + width, image_size)
-        mask[:, :, y0:y1, :] = 1.0
-        mask[:, :, :, x0:x1] = 1.0
-    return mask
-
-
-# ---------------------------------------------------------------------------
-# DiT denoiser sub-modules
-# ---------------------------------------------------------------------------
-
-class _TimestepEmbedding(nn.Module):
-    """Sinusoidal timestep embedding followed by a two-layer MLP."""
+class SinusoidalTimestepEmbedding(nn.Module):
+    """Sinusoidal positional embedding for diffusion timesteps."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.dim = dim
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim),
-        )
+        self.dim = int(dim)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
         freqs = torch.exp(
-            -math.log(10_000)
-            * torch.arange(half, device=t.device, dtype=torch.float32)
-            / (half - 1)
+            -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / max(half, 1)
         )
-        args = t[:, None].float() * freqs[None]
-        emb = torch.cat([args.sin(), args.cos()], dim=-1)
-        return self.mlp(emb)
+        args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
 
 
-class _AdaLN(nn.Module):
-    """Adaptive LayerNorm: scale and shift from a conditioning vector."""
+class TimestepMLP(nn.Module):
+    """Projects sinusoidal timestep embeddings to the model width."""
 
-    def __init__(self, dim: int, cond_dim: int) -> None:
+    def __init__(self, time_dim: int, model_dim: int) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.proj = nn.Linear(cond_dim, 2 * dim)
+        self.embed = SinusoidalTimestepEmbedding(time_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(time_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, model_dim),
+        )
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # cond: (B, cond_dim)  → scale/shift: (B, 1, dim)
-        scale, shift = self.proj(cond).unsqueeze(1).chunk(2, dim=-1)
-        return self.norm(x) * (1.0 + scale) + shift
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.embed(t))
 
 
-class _DiTBlock(nn.Module):
-    """Single DiT block: adaLN → MHSA → adaLN → FFN, with residuals."""
+class PatchMLPBlock(nn.Module):
+    """Single MLP block with pre-norm and residual connection."""
+
+    def __init__(self, dim: int, expand: int = 4) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * expand),
+            nn.GELU(),
+            nn.Linear(dim * expand, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.norm(x))
+
+
+def window_partition(x: torch.Tensor, grid_h: int, grid_w: int, win: int) -> torch.Tensor:
+    """Partition (B, N, D) tokens arranged in a 2D grid into windows."""
+    B, _, D = x.shape
+    x = x.view(B, grid_h, grid_w, D)
+    x = x.view(B, grid_h // win, win, grid_w // win, win, D)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(-1, win * win, D)
+
+
+def window_unpartition(x: torch.Tensor, grid_h: int, grid_w: int, win: int, B: int) -> torch.Tensor:
+    """Reverse of window_partition."""
+    nw_h, nw_w = grid_h // win, grid_w // win
+    x = x.view(B, nw_h, nw_w, win, win, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(B, grid_h * grid_w, -1)
+
+
+class MultiHeadSelfAttention(nn.Module):
+    """Standard multi-head self-attention using scaled dot-product attention."""
+
+    def __init__(self, dim: int, heads: int = 8, head_dim: int = 64) -> None:
+        super().__init__()
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        inner = self.heads * self.head_dim
+        self.qkv = nn.Linear(dim, 3 * inner, bias=False)
+        self.out = nn.Linear(inner, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, _ = x.shape
+        qkv = self.qkv(x).view(B, N, 3, self.heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.transpose(1, 2).contiguous().view(B, N, -1)
+        return self.out(attn)
+
+
+class SpatialAttentionBlock(nn.Module):
+    """Single spatial attention block with windowed/global attention and FFN."""
 
     def __init__(
         self,
         dim: int,
-        heads: int,
-        cond_dim: int,
-        mlp_ratio: int = 4,
-        dropout: float = 0.0,
+        heads: int = 8,
+        head_dim: int = 64,
+        ff_expand: int = 4,
+        is_global: bool = False,
     ) -> None:
         super().__init__()
-        self.norm1 = _AdaLN(dim, cond_dim)
-        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
-        self.norm2 = _AdaLN(dim, cond_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
+        self.is_global = is_global
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = MultiHeadSelfAttention(dim, heads, head_dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_expand),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mlp_ratio, dim),
+            nn.Linear(dim * ff_expand, dim),
         )
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x, cond)
-        h, _ = self.attn(h, h, h)
-        x = x + h
-        x = x + self.ffn(self.norm2(x, cond))
-        return x
+    def forward(self, x: torch.Tensor, grid_h: int, grid_w: int, window_size: int) -> torch.Tensor:
+        B = x.size(0)
+        residual = x
+        h = self.norm1(x)
+        if self.is_global:
+            h = self.self_attn(h)
+        else:
+            h = window_partition(h, grid_h, grid_w, window_size)
+            h = self.self_attn(h)
+            h = window_unpartition(h, grid_h, grid_w, window_size, B)
+        x = residual + h
+        return x + self.ff(self.norm2(x))
 
 
-class _DiTDenoiser(nn.Module):
-    """Diffusion Transformer denoiser.
-
-    Maps (z_t, t, c) → predicted clean latent ẑ₀.
-
-    Args:
-        num_patches:  Number of spatial patch tokens N.
-        latent_dim:   Per-patch latent dimension d.
-        depth:        Number of DiT blocks.
-        heads:        Attention heads per block.
-        num_classes:  Number of class labels (CIFAR-10 → 10).
-        dropout:      Dropout inside attention and FFN.
-    """
+class StructuredCovarianceHead(nn.Module):
+    """Predicts per-patch structured covariance parameters."""
 
     def __init__(
         self,
-        num_patches: int,
-        latent_dim: int,
-        depth: int = 6,
-        heads: int = 4,
-        num_classes: int = 10,
-        dropout: float = 0.1,
+        model_dim: int,
+        patch_dim: int,
+        rank: int,
+        min_log_sigma: float = -1.5,
+        max_log_sigma: float = 1.5,
+        log_sigma_temperature: float = 3.0,
     ) -> None:
         super().__init__()
-        cond_dim = latent_dim
-
-        self.input_proj = nn.Linear(latent_dim, latent_dim)
-        self.pos_emb = nn.Parameter(
-            torch.randn(1, num_patches, latent_dim) * 0.02
-        )
-        self.t_emb = _TimestepEmbedding(latent_dim)
-        self.c_emb = nn.Embedding(num_classes + 1, latent_dim)  # +1 for null CFG token
-
-        self.blocks = nn.ModuleList([
-            _DiTBlock(latent_dim, heads, cond_dim, dropout=dropout)
-            for _ in range(depth)
-        ])
-        self.final_norm = nn.LayerNorm(latent_dim)
-        self.final_proj = nn.Linear(latent_dim, latent_dim)
-
-        # Zero-init output projection (standard DiT practice)
-        nn.init.zeros_(self.final_proj.weight)
-        nn.init.zeros_(self.final_proj.bias)
+        self.patch_dim = int(patch_dim)
+        self.rank = int(rank)
+        self.min_log_sigma = float(min_log_sigma)
+        self.max_log_sigma = float(max_log_sigma)
+        self.log_sigma_temperature = float(log_sigma_temperature)
+        self.mu_head = nn.Linear(model_dim, patch_dim)
+        self.log_sigma_head = nn.Linear(model_dim, patch_dim)
+        self.V_head = nn.Linear(model_dim, patch_dim * rank)
 
     def forward(
         self,
-        z_t: torch.Tensor,
-        t: torch.Tensor,
-        c: torch.Tensor,
+        tokens: torch.Tensor,
+        rank_fraction: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, _ = tokens.shape
+        d, k = self.patch_dim, self.rank
+        mu = self.mu_head(tokens)
+        log_sigma_span = self.max_log_sigma - self.min_log_sigma
+        temp = max(self.log_sigma_temperature, 1e-6)
+        log_sigma_logits = self.log_sigma_head(tokens) / temp
+        log_sigma = self.min_log_sigma + log_sigma_span * torch.sigmoid(log_sigma_logits)
+        sigma = torch.exp(log_sigma)
+        V = self.V_head(tokens).view(B, N, d, k)
+
+        active_k = max(1, min(k, int(round(k * float(rank_fraction)))))
+        if active_k < k:
+            V = V.clone()
+            V[:, :, :, active_k:] = 0.0
+        return mu, sigma, V
+
+
+def structured_sample(
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    V: torch.Tensor,
+    stochasticity: float = 1.0,
+) -> torch.Tensor:
+    """Reparameterized sample from N(mu, Diag(sigma) + V V^T)."""
+    if stochasticity == 0.0:
+        return mu
+    B, N, d = mu.shape
+    k = V.shape[-1]
+    eps1 = torch.randn(B, N, d, device=mu.device, dtype=mu.dtype)
+    eps2 = torch.randn(B, N, k, 1, device=mu.device, dtype=mu.dtype)
+    diag_component = torch.sqrt(sigma) * eps1
+    lr_component = (V @ eps2).squeeze(-1)
+    return mu + float(stochasticity) * (diag_component + lr_component)
+
+
+def patchify(images: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """(B, C, H, W) -> (B, N, d)."""
+    B, C, H, W = images.shape
+    p = int(patch_size)
+    gh, gw = H // p, W // p
+    x = images.view(B, C, gh, p, gw, p)
+    x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+    return x.view(B, gh * gw, C * p * p)
+
+
+def unpatchify(
+    patches: torch.Tensor,
+    patch_size: int,
+    channels: int,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    """(B, N, d) -> (B, C, H, W)."""
+    B, _, _ = patches.shape
+    p = int(patch_size)
+    gh, gw = H // p, W // p
+    x = patches.view(B, gh, gw, channels, p, p)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+    return x.view(B, channels, H, W)
+
+
+class BoundaryRefinementNet(nn.Module):
+    """Lightweight ConvNet that smooths patch boundaries."""
+
+    def __init__(self, channels: int = 3, hidden: int = 64, patch_size: int = 64, border_width: int = 8) -> None:
+        super().__init__()
+        self.patch_size = int(patch_size)
+        self.border_width = int(border_width)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 3, padding=1),
+        )
+
+    def _boundary_mask(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        mask = torch.zeros(1, 1, H, W, device=device)
+        p, bw = self.patch_size, self.border_width
+        for y in range(p, H, p):
+            mask[:, :, max(0, y - bw): min(H, y + bw), :] = 1.0
+        for x in range(p, W, p):
+            mask[:, :, :, max(0, x - bw): min(W, x + bw)] = 1.0
+        return mask
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        mask = self._boundary_mask(H, W, x.device)
+        correction = self.net(x)
+        return x + mask * correction
+
+
+class SCPDTLoss(nn.Module):
+    """Woodbury-based structured Gaussian loss for patch diffusion."""
+
+    def __init__(
+        self,
+        lambda_recon: float = 1.0,
+        lambda_boundary: float = 0.1,
+        lambda_rank: float = 0.01,
+        lambda_sigma: float = 0.05,
+        patch_size: int = 64,
+        sigma_reg_target: float = 0.3,
+    ) -> None:
+        super().__init__()
+        self.lambda_recon = float(lambda_recon)
+        self.lambda_boundary = float(lambda_boundary)
+        self.lambda_rank = float(lambda_rank)
+        self.lambda_sigma = float(lambda_sigma)
+        self.patch_size = int(patch_size)
+        self.sigma_reg_target = float(sigma_reg_target)
+
+    def _woodbury_loss(
+        self,
+        x0_patches: torch.Tensor,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        V: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            z_t: Noisy latents  (B, N, d).
-            t:   Timestep indices  (B,).
-            c:   Class labels  (B,).
+        residual = x0_patches - mu
+        D_inv = 1.0 / sigma
+        D_inv_V = D_inv.unsqueeze(-1) * V
+        VtDiV = torch.einsum("bndk,bndj->bnkj", V, D_inv_V)
+        rank = V.shape[-1]
+        eye_k = torch.eye(rank, device=mu.device, dtype=mu.dtype).view(1, 1, rank, rank)
+        batch_shape = V.shape[:-2]
+        M = (eye_k + VtDiV).reshape(-1, rank, rank).contiguous()
+        jitter = 1e-6
+        M = M + jitter * torch.eye(rank, device=mu.device, dtype=mu.dtype).unsqueeze(0)
+        L = torch.linalg.cholesky(M)
 
-        Returns:
-            Predicted clean latent  (B, N, d).
-        """
-        x = self.input_proj(z_t) + self.pos_emb          # (B, N, d)
-        cond = self.t_emb(t) + self.c_emb(c)             # (B, d)
-        for block in self.blocks:
-            x = block(x, cond)
-        return self.final_proj(self.final_norm(x))        # (B, N, d)
+        D_inv_r = D_inv * residual
+        Vt_D_inv_r = torch.einsum("bndk,bnd->bnk", V, D_inv_r).reshape(-1, rank, 1).contiguous()
+        y = torch.linalg.solve_triangular(L, Vt_D_inv_r, upper=False)
+        x = torch.linalg.solve_triangular(L.transpose(-2, -1), y, upper=True)
+        M_inv_Vt_D_inv_r = x.reshape(*batch_shape, rank)
+        correction = torch.einsum("bndk,bnk->bnd", D_inv_V, M_inv_Vt_D_inv_r)
+        sigma_inv_r = D_inv_r - correction
 
+        quad_form = (residual * sigma_inv_r).sum(dim=-1)
+        log_det_D = torch.log(sigma).sum(dim=-1)
+        log_det_M = (2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1))).sum(dim=-1).reshape(*batch_shape)
+        gaussian_const = x0_patches.shape[-1] * math.log(2.0 * math.pi)
+        nll = 0.5 * (quad_form + log_det_D + log_det_M + gaussian_const)
+        nll = nll / max(float(x0_patches.shape[-1]), 1.0)
+        return nll.mean()
 
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
+    def _boundary_loss(self, image: torch.Tensor) -> torch.Tensor:
+        p = self.patch_size
+        _, _, H, W = image.shape
+        loss = torch.zeros((), device=image.device, dtype=image.dtype)
+        count = 0
+        for y in range(p, H, p):
+            loss = loss + (image[:, :, y, :] - image[:, :, y - 1, :]).square().mean()
+            count += 1
+        for x in range(p, W, p):
+            loss = loss + (image[:, :, :, x] - image[:, :, :, x - 1]).square().mean()
+            count += 1
+        return loss / max(count, 1)
+
+    def forward(
+        self,
+        x0: torch.Tensor,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        V: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        x0_patches = patchify(x0, self.patch_size)
+        recon_loss = self._woodbury_loss(x0_patches, mu, sigma, V)
+        x0_recon = unpatchify(mu, self.patch_size, x0.shape[1], x0.shape[2], x0.shape[3])
+        boundary_loss = self._boundary_loss(x0_recon)
+        rank_penalty = V.square().mean()
+        sigma_penalty = F.relu(self.sigma_reg_target - sigma).square().mean()
+        total = (
+            self.lambda_recon * recon_loss
+            + self.lambda_boundary * boundary_loss
+            + self.lambda_rank * rank_penalty
+            + self.lambda_sigma * sigma_penalty
+        )
+        return {
+            "total": total,
+            "recon": recon_loss.detach(),
+            "boundary": boundary_loss.detach(),
+            "rank_penalty": rank_penalty.detach(),
+            "sigma_penalty": sigma_penalty.detach(),
+            "sigma_mean": sigma.mean().detach(),
+            "sigma_min": sigma.amin().detach(),
+        }
+
 
 class SCCDModel(nn.Module):
-    """Structured-Covariance Consistency Diffusion model.
-
-    Implements the SupportsVAEAPI protocol so it can be plugged into the
-    existing training, evaluation, and generation infrastructure unchanged.
-
-    ``forward()`` runs the full training graph and returns the standard
-    ``(recon, mu, log_var, z)`` 4-tuple that VAELoss expects.  It also
-    caches ``_cached_kl`` and ``_cached_kl_per_dim`` exactly like
-    GeneralizedPosteriorVAE does.
-
-    The consistency loss lives in ``consistency_loss()`` and is called
-    separately by the Phase-2 training loop so the composite VAELoss
-    can remain unmodified.
-
-    Args:
-        image_size:          Square input image side length.
-        patch_div:           Number of patches per side (image_size // patch_div = patch_size).
-        in_channels:         Input image channels.
-        latent_dim:          Per-patch latent dimension d.
-        covariance_rank:     Low-rank factor k in Σ = Diag(σ²) + VVᵀ.
-        encoder_channels:    CNN channel widths for the patch encoder.
-        decoder_channels:    Transposed-CNN channel widths for the patch decoder.
-        transformer_dim:     Hidden dim for the cross-patch transformer encoder/decoder.
-        transformer_heads:   Number of attention heads in those transformers.
-        transformer_layers:  Depth of those transformers.
-        transformer_dropout: Dropout in those transformers.
-        dit_depth:           Number of DiT blocks in the denoiser.
-        dit_heads:           Attention heads per DiT block.
-        dit_dropout:         Dropout inside DiT blocks.
-        num_classes:         Number of class labels for the DiT conditioning.
-        T:                   Total diffusion timesteps.
-        use_batch_norm:      Toggle BatchNorm in the patch CNN.
-    """
+    """SC-PDT model, exposed through the existing `sccd` model type."""
 
     def __init__(
         self,
         image_size: int = 32,
-        patch_div: int = 2,
-        in_channels: int = 3,
-        latent_dim: int = 64,
-        covariance_rank: int = 8,
-        encoder_channels: Sequence[int] = (32, 64, 128, 256),
-        decoder_channels: Sequence[int] = (256, 128, 64, 32),
-        transformer_dim: int = 256,
-        transformer_heads: int = 8,
-        transformer_layers: int = 4,
-        transformer_dropout: float = 0.1,
-        dit_depth: int = 6,
-        dit_heads: int = 4,
-        dit_dropout: float = 0.1,
-        num_classes: int = 10,
-        T: int = 1000,
-        sample_steps: int = 1,
-        use_batch_norm: bool = True,
+        patch_size: int = 16,
+        channels: int = 3,
+        model_dim: int = 256,
+        num_enc_blocks: int = 2,
+        num_attn_blocks: int = 4,
+        heads: int = 4,
+        head_dim: int = 64,
+        rank: int = 8,
+        window_size: int = 2,
+        global_every: int = 4,
+        diffusion_T: int = 1000,
+        sample_steps: int = 2,
+        sampler_mode: str = "hybrid",
+        ddim_eta: float = 0.0,
+        rank_gamma: float = 1.5,
+        k_min_frac: float = 0.125,
+        boundary_hidden: int = 64,
+        boundary_width: int = 2,
+        lambda_recon: float = 1.0,
+        lambda_boundary: float = 0.1,
+        lambda_rank: float = 0.01,
+        lambda_sigma: float = 0.05,
+        sigma_reg_target: float = 0.3,
+        min_log_sigma: float = -1.5,
+        max_log_sigma: float = 1.5,
+        log_sigma_temperature: float = 3.0,
     ) -> None:
         super().__init__()
-
-        self.image_size = image_size
-        self.patch_div = patch_div
-        self.patch_size = image_size // patch_div
-        self.num_patches = patch_div ** 2
-        self.latent_dim = latent_dim
-        self.cov_rank = covariance_rank
+        self.image_size = int(image_size)
+        self.patch_size = int(patch_size)
+        self.channels = int(channels)
+        self.rank = int(rank)
+        self.window_size = int(window_size)
+        self.grid_h = self.image_size // self.patch_size
+        self.grid_w = self.image_size // self.patch_size
+        self.num_patches = self.grid_h * self.grid_w
+        self.patch_dim = self.patch_size * self.patch_size * self.channels
         self.sample_steps = int(sample_steps)
+        self.sampler_mode = sampler_mode
+        self.ddim_eta = float(ddim_eta)
+        self.rank_gamma = float(rank_gamma)
+        self.k_min_frac = float(k_min_frac)
 
-        # ── Encoder ────────────────────────────────────────────────────────
-        self.patch_cnn = _make_patch_cnn(
-            in_channels, encoder_channels, use_bn=use_batch_norm
-        )
-        feat_dim = encoder_channels[-1]
-        self.enc_proj = nn.Linear(feat_dim, transformer_dim)
-        self.encoder_pos = nn.Parameter(
-            torch.randn(1, self.num_patches, transformer_dim) * 0.02
-        )
-        enc_layer = nn.TransformerEncoderLayer(
-            transformer_dim,
-            transformer_heads,
-            transformer_dim * 4,
-            dropout=transformer_dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            enc_layer, transformer_layers, enable_nested_tensor=False
-        )
-        self.fc_mu = nn.Linear(transformer_dim, latent_dim)
-        self.fc_log_sigma = nn.Linear(transformer_dim, latent_dim)
-        self.fc_V = nn.Linear(transformer_dim, latent_dim * covariance_rank)
+        if self.image_size % self.patch_size != 0:
+            raise ValueError("`image_size` must be divisible by `patch_size` for SC-PDT")
+        if self.grid_h % self.window_size != 0 or self.grid_w % self.window_size != 0:
+            raise ValueError("SC-PDT window size must divide the patch grid dimensions")
 
-        # ── Latent refinement (post-reparameterisation MHSA) ───────────────
-        self.global_token = nn.Parameter(torch.zeros(1, 1, latent_dim))
-        self.latent_pos = nn.Parameter(
-            torch.randn(1, self.num_patches + 1, latent_dim) * 0.02
+        self.patch_embed = nn.Linear(self.patch_dim, model_dim)
+        self.time_embed = TimestepMLP(256, model_dim)
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, model_dim) * 0.02)
+        self.patch_encoder = nn.Sequential(*[PatchMLPBlock(model_dim) for _ in range(num_enc_blocks)])
+        self.attn_blocks = nn.ModuleList(
+            [
+                SpatialAttentionBlock(
+                    dim=model_dim,
+                    heads=heads,
+                    head_dim=head_dim,
+                    is_global=((idx + 1) % max(global_every, 1) == 0),
+                )
+                for idx in range(num_attn_blocks)
+            ]
         )
-        latent_heads = min(transformer_heads, latent_dim)
-        while latent_heads > 1 and (latent_dim % latent_heads) != 0:
-            latent_heads -= 1
-        self.latent_refine = _LatentRefinement(
-            latent_dim,
-            heads=max(1, latent_heads),
-            layers=2,
-            dropout=transformer_dropout,
+        self.final_norm = nn.LayerNorm(model_dim)
+        self.cov_head = StructuredCovarianceHead(
+            model_dim,
+            self.patch_dim,
+            self.rank,
+            min_log_sigma=min_log_sigma,
+            max_log_sigma=max_log_sigma,
+            log_sigma_temperature=log_sigma_temperature,
         )
-
-        # ── Decoder ────────────────────────────────────────────────────────
-        self.dec_proj = nn.Linear(latent_dim, transformer_dim)
-        dec_layer = nn.TransformerEncoderLayer(
-            transformer_dim,
-            transformer_heads,
-            transformer_dim * 4,
-            dropout=transformer_dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.transformer_decoder = nn.TransformerEncoder(
-            dec_layer, transformer_layers, enable_nested_tensor=False
-        )
-        self.patch_decoder = _PatchTokenDecoder(
-            token_dim=transformer_dim,
-            hidden_channels=decoder_channels,
-            out_channels=in_channels,
+        self.boundary_refine = BoundaryRefinementNet(
+            channels=self.channels,
+            hidden=boundary_hidden,
             patch_size=self.patch_size,
+            border_width=boundary_width,
         )
-        self.seam_refiner = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, in_channels, 3, padding=1),
-        )
-        self.register_buffer(
-            "seam_mask",
-            _build_seam_mask(image_size, self.patch_size, width=2),
-            persistent=False,
+        self.schedule = CosineNoiseSchedule(T=diffusion_T)
+        self.loss_fn = SCPDTLoss(
+            lambda_recon=lambda_recon,
+            lambda_boundary=lambda_boundary,
+            lambda_rank=lambda_rank,
+            lambda_sigma=lambda_sigma,
+            patch_size=self.patch_size,
+            sigma_reg_target=sigma_reg_target,
         )
 
-        # ── Diffusion schedule & DiT denoiser ──────────────────────────────
-        self.schedule = CosineNoiseSchedule(T=T)
-        self.denoiser = _DiTDenoiser(
-            num_patches=self.num_patches,
-            latent_dim=latent_dim,
-            depth=dit_depth,
-            heads=dit_heads,
-            num_classes=num_classes,
-            dropout=dit_dropout,
-        )
-        # EMA copy of the denoiser used as consistency training target
-        self.ema_denoiser = copy.deepcopy(self.denoiser)
-        for p in self.ema_denoiser.parameters():
-            p.requires_grad_(False)
-
-        # ── KL cache (mirrors GeneralizedPosteriorVAE) ─────────────────────
-        self._cached_kl: torch.Tensor | None = None
-        self._cached_kl_per_dim: torch.Tensor | None = None
-
-    # -----------------------------------------------------------------------
-    # Patchify / unpatchify  (identical to gp_vae.py)
-    # -----------------------------------------------------------------------
-
-    def patchify(self, x: torch.Tensor) -> torch.Tensor:
-        batch, channels, _, _ = x.shape
-        patch = self.patch_size
-        patches = x.unfold(2, patch, patch).unfold(3, patch, patch)
-        patches = patches.permute(0, 2, 3, 1, 4, 5)
-        return patches.reshape(batch, self.num_patches, channels, patch, patch)
-
-    def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        batch, _, channels, patch, _ = patches.shape
-        grid = self.patch_div
-        patches = patches.reshape(batch, grid, grid, channels, patch, patch)
-        patches = patches.permute(0, 3, 1, 4, 2, 5)
-        return patches.reshape(batch, channels, grid * patch, grid * patch)
-
-    # -----------------------------------------------------------------------
-    # Encoder
-    # -----------------------------------------------------------------------
-
-    def encode_distribution(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (mu, log_sigma, V) for each patch.
-
-        Shapes:
-            mu, log_sigma : (B, N, d)
-            V             : (B, N, d, k)
-        """
-        batch = x.size(0)
-        patches = self.patchify(x)
-        flat = patches.reshape(
-            batch * self.num_patches, patches.size(2), self.patch_size, self.patch_size
-        )
-        feats = self.patch_cnn(flat).mean([2, 3])            # (B*N, feat_dim)
-        feats = feats.view(batch, self.num_patches, -1)
-
-        tokens = self.enc_proj(feats) + self.encoder_pos
-        ctx = self.transformer_encoder(tokens)               # (B, N, transformer_dim)
-
-        mu = self.fc_mu(ctx)                                 # (B, N, d)
-        log_sigma = self.fc_log_sigma(ctx)                   # (B, N, d)
-        V = self.fc_V(ctx).view(
-            batch, self.num_patches, self.latent_dim, self.cov_rank
-        )                                                    # (B, N, d, k)
-        return mu, log_sigma, V
-
-    def encode_latent_mean(self, x: torch.Tensor) -> torch.Tensor:
-        mu, _, _ = self.encode_distribution(x)
-        return mu
-
-    def _cholesky(
-        self, sigma: torch.Tensor, V: torch.Tensor
-    ) -> torch.Tensor:
-        """Cholesky of Σ = Diag(σ²) + VVᵀ.
-
-        Args:
-            sigma : (B, N, d)  standard deviations (not squared).
-            V     : (B, N, d, k)
-
-        Returns:
-            L : (B, N, d, d)  lower-triangular Cholesky factor.
-        """
-        sigma2_diag = torch.diag_embed(sigma ** 2)           # (B, N, d, d)
-        VVT = torch.einsum("bndk,bnek->bnde", V, V)         # (B, N, d, d)
-        Sigma = sigma2_diag + VVT
-        jitter = 1e-5 * torch.eye(
-            self.latent_dim, device=sigma.device, dtype=sigma.dtype
-        ).unsqueeze(0).unsqueeze(0)
-        return torch.linalg.cholesky(Sigma + jitter)         # (B, N, d, d)
-
-    def reparam(
-        self,
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-        V: torch.Tensor,
-    ) -> torch.Tensor:
-        """Reparameterised sample using the low-rank + diagonal trick.
-
-        z = μ + σ ⊙ ε₁ + V ε₂,   ε₁ ~ N(0,I_d),  ε₂ ~ N(0,I_k)
-
-        Mirrors the formula in the original gp_vae.py exactly.
-        """
-        sigma = torch.exp(log_sigma)
-        eps1 = torch.randn_like(mu)
-        eps2 = torch.randn(
-            *mu.shape[:-1], self.cov_rank, device=mu.device, dtype=mu.dtype
-        )
-        return mu + sigma * eps1 + (V @ eps2.unsqueeze(-1)).squeeze(-1)
-
-    # -----------------------------------------------------------------------
-    # Latent refinement (global token + MHSA)
-    # -----------------------------------------------------------------------
-
-    def _refine(self, z: torch.Tensor) -> torch.Tensor:
-        """Normalise → prepend global token → MHSA → strip global token."""
-        batch = z.size(0)
-        z = z / (z.std(dim=-1, keepdim=True) + 1e-6)
-        global_token = self.global_token.expand(batch, -1, -1)
-        z = torch.cat([global_token, z], dim=1) + self.latent_pos
-        z = self.latent_refine(z)
-        return z[:, 1:]                                      # strip global token
-
-    # -----------------------------------------------------------------------
-    # Decoder
-    # -----------------------------------------------------------------------
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode refined latent tokens to a full image.
-
-        Args:
-            z: (B, N, d) refined latent tokens.
-
-        Returns:
-            Reconstructed image  (B, C, H, W)  in [0, 1].
-        """
-        batch = z.size(0)
-        tokens = self.transformer_decoder(self.dec_proj(z))  # (B, N, transformer_dim)
-        tokens_flat = tokens.reshape(batch * self.num_patches, -1)
-        patches = self.patch_decoder(tokens_flat)            # (B*N, C, p, p)
-        patches = patches.view(
-            batch, self.num_patches, patches.size(1), self.patch_size, self.patch_size
-        )
-        image = self.unpatchify(patches)                     # (B, C, H, W)
-        delta = self.seam_refiner(image)
-        image = image + self.seam_mask.to(dtype=image.dtype, device=image.device) * delta
-        return torch.sigmoid(image)
-
-    # -----------------------------------------------------------------------
-    # Forward  (VAELoss-compatible 4-tuple)
-    # -----------------------------------------------------------------------
+    def _rank_fraction(self, t: torch.Tensor) -> float:
+        # Use the average timestep across the batch. Using `t.max()` makes the
+        # schedule effectively constant for typical batch sizes because the max
+        # is almost always near T-1.
+        t_value = float(t.float().mean().item()) if t.numel() > 0 else 0.0
+        denom = max(float(self.schedule.T - 1), 1.0)
+        frac = (t_value / denom) ** self.rank_gamma
+        return self.k_min_frac + (1.0 - self.k_min_frac) * frac
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Phase-1 / VAE forward pass.
-
-        Encodes → reparameterises → refines → decodes.
-        Caches KL for VAELoss.get_kl_override().
-
-        Returns:
-            recon   : (B, C, H, W) reconstructed image in [0, 1].
-            mu      : (B, N, d) posterior means.
-            log_var : (B, N, d) = 2 * log_sigma  (convention matches vae.py).
-            z       : (B, N, d) refined latent tokens (global token stripped).
-        """
-        mu, log_sigma, V = self.encode_distribution(x)
-        z = self.reparam(mu, log_sigma, V)
-        z = self._refine(z)
-        recon = self.decode(z)
-
-        kl_tokens, kl_per_dim_tokens = low_rank_kl_per_dim(
-            mu.reshape(-1, self.latent_dim),
-            log_sigma.reshape(-1, self.latent_dim),
-            V.reshape(-1, self.latent_dim, self.cov_rank),
-        )
-        self._cached_kl = kl_tokens * self.num_patches
-        self._cached_kl_per_dim = kl_per_dim_tokens * self.num_patches
-
-        log_var = 2.0 * log_sigma
-        return recon, mu, log_var, z
-
-    # -----------------------------------------------------------------------
-    # Consistency diffusion
-    # -----------------------------------------------------------------------
-
-    def diffusion_forward(
         self,
-        x: torch.Tensor,
-        c: torch.Tensor,
-        k_steps: int = 5,
-    ) -> dict[str, torch.Tensor]:
-        """Phase-2 forward pass adding the consistency loss term.
-
-        Runs the GP-VAE encode/decode path (same as forward()) and
-        additionally computes the consistency denoising loss.  The
-        combined loss dict is consumed by the Phase-2 training loop;
-        the recon / KL terms are still passed to VAELoss normally.
-
-        Args:
-            x:       Input images  (B, C, H, W).
-            c:       Class labels  (B,).
-            k_steps: Maximum consistency gap between t and t′.
-
-        Returns:
-            Dict with keys ``recon``, ``mu``, ``log_var``, ``z``,
-            ``loss_cons``, ``z_hat``.
-        """
-        mu, log_sigma, V = self.encode_distribution(x)
-        sigma = torch.exp(log_sigma)
-        L = self._cholesky(sigma, V)                         # (B, N, d, d)
-
-        z_raw = self.reparam(mu, log_sigma, V)
-        z_hat = self._refine(z_raw)                          # clean latent
-        recon = self.decode(z_hat)
-
-        kl_tokens, kl_per_dim_tokens = low_rank_kl_per_dim(
-            mu.reshape(-1, self.latent_dim),
-            log_sigma.reshape(-1, self.latent_dim),
-            V.reshape(-1, self.latent_dim, self.cov_rank),
-        )
-        self._cached_kl = kl_tokens * self.num_patches
-        self._cached_kl_per_dim = kl_per_dim_tokens * self.num_patches
-
-        # Sample timestep pair (t, t′) with t > t′
-        B = x.size(0)
-        # NOTE: schedule buffers are indexed in [0, T-1] (length = T).
-        # torch.randint upper-bound is exclusive, so this samples [1, T-1].
-        t = torch.randint(1, self.schedule.T, (B,), device=x.device)
-        dt = torch.randint(1, k_steps + 1, (B,), device=x.device)
-        t = t.clamp(min=0, max=self.schedule.T - 1)
-        t_prime = (t - dt).clamp(min=0, max=self.schedule.T - 1)
-
-        z_t = self.schedule.q_sample(z_hat, t, L)
-        z_t_prime = self.schedule.q_sample(z_hat, t_prime, L)
-
-        # Online denoiser prediction
-        z0_pred = self.denoiser(z_t, t, c)                   # (B, N, d)
-
-        # EMA target (no gradient)
-        with torch.no_grad():
-            z0_target = self.ema_denoiser(z_t_prime, t_prime, c)
-
-        loss_cons = F.mse_loss(z0_pred, z0_target)
-
-        log_var = 2.0 * log_sigma
-        return {
-            "recon":     recon,
-            "mu":        mu,
-            "log_var":   log_var,
-            "z":         z_hat,
-            "loss_cons": loss_cons,
-            "z_hat":     z_hat,
-        }
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        rank_fraction: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del cond
+        if rank_fraction is None:
+            rank_fraction = self._rank_fraction(t)
+        patches = patchify(x_t, self.patch_size)
+        h = self.patch_embed(patches) + self.pos_embed
+        h = h + self.time_embed(t).unsqueeze(1)
+        h = self.patch_encoder(h)
+        for block in self.attn_blocks:
+            h = block(h, self.grid_h, self.grid_w, self.window_size)
+        h = self.final_norm(h)
+        return self.cov_head(h, rank_fraction=rank_fraction)
 
     @torch.no_grad()
-    def update_ema(self, decay: float = 0.999) -> None:
-        """Exponential moving-average update of the EMA denoiser."""
-        for p_ema, p in zip(
-            self.ema_denoiser.parameters(), self.denoiser.parameters()
-        ):
-            p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+    def predict_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, sigma, V = self(x_t, t, rank_fraction=self._rank_fraction(t))
+        x0_pred = unpatchify(mu, self.patch_size, self.channels, self.image_size, self.image_size)
+        return x0_pred, mu, sigma, V
 
-    def denoiser_params(self) -> Iterator[nn.Parameter]:
-        """Yield only the online denoiser's parameters (for separate LR)."""
-        yield from self.denoiser.parameters()
+    def training_loss(
+        self,
+        x0: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        del labels
+        B = x0.shape[0]
+        t = torch.randint(0, self.schedule.T, (B,), device=x0.device)
+        x_t = self.schedule.q_sample(x0, t)
+        mu, sigma, V = self(x_t, t, rank_fraction=self._rank_fraction(t))
+        losses = self.loss_fn(x0, mu, sigma, V)
+        losses["x0_pred"] = unpatchify(mu, self.patch_size, self.channels, x0.shape[2], x0.shape[3])
+        return losses
 
-    def vae_params(self) -> Iterator[nn.Parameter]:
-        """Yield encoder + decoder parameters (excludes denoiser and EMA)."""
-        excluded = {
-            *self.denoiser.parameters(),
-            *self.ema_denoiser.parameters(),
-            *self.schedule.parameters(),
-        }
-        for p in self.parameters():
-            if p not in excluded:
-                yield p
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+        t = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        x0_pred, _, _, _ = self.predict_x0(x, t)
+        return self.boundary_refine(x0_pred).clamp(0.0, 1.0)
 
-    # -----------------------------------------------------------------------
-    # Sampling  (SupportsVAEAPI)
-    # -----------------------------------------------------------------------
+    def _sample_ddim(
+        self,
+        initial: torch.Tensor,
+        num_steps: int,
+        eta: float,
+    ) -> torch.Tensor:
+        x = initial
+        step_indices = torch.linspace(self.schedule.T - 1, 0, num_steps + 1, device=x.device).long().tolist()
+        for idx in range(num_steps):
+            t_now = step_indices[idx]
+            t_next = step_indices[idx + 1]
+            t_tensor = torch.full((x.shape[0],), t_now, device=x.device, dtype=torch.long)
+            x0_pred, mu_patches, sigma_patches, V_patches = self.predict_x0(x, t_tensor)
+
+            if t_next == 0:
+                x = self.boundary_refine(x0_pred)
+                continue
+
+            alpha_now = self.schedule.alphas_cumprod[t_now]
+            alpha_next = self.schedule.alphas_cumprod[t_next]
+            sqrt_alpha_now = self.schedule.sqrt_alphas_cumprod[t_now]
+            sqrt_one_minus_now = self.schedule.sqrt_one_minus_alphas_cumprod[t_now]
+            eps_pred = (x - sqrt_alpha_now * x0_pred) / (sqrt_one_minus_now + 1e-8)
+
+            sigma_ddim = (
+                eta
+                * torch.sqrt((1.0 - alpha_next) / (1.0 - alpha_now + 1e-8))
+                * torch.sqrt(torch.clamp(1.0 - alpha_now / (alpha_next + 1e-8), min=0.0))
+            )
+            dir_coeff = torch.sqrt(torch.clamp(1.0 - alpha_next - sigma_ddim**2, min=0.0))
+            x = torch.sqrt(alpha_next) * x0_pred + dir_coeff * eps_pred
+
+            if eta > 0:
+                noise_patches = structured_sample(
+                    mu=torch.zeros_like(mu_patches),
+                    sigma=sigma_patches,
+                    V=V_patches,
+                    stochasticity=1.0,
+                )
+                structured_noise = unpatchify(
+                    noise_patches,
+                    self.patch_size,
+                    self.channels,
+                    self.image_size,
+                    self.image_size,
+                )
+                x = x + sigma_ddim * structured_noise
+
+        return self.boundary_refine(x).clamp(0.0, 1.0)
+
+    def _sample_consistency(self, initial: torch.Tensor) -> torch.Tensor:
+        t = torch.full((initial.shape[0],), self.schedule.T - 1, device=initial.device, dtype=torch.long)
+        x0_pred, mu, sigma, V = self.predict_x0(initial, t)
+        noise = structured_sample(mu, sigma, V, stochasticity=0.1)
+        x0_corrected = unpatchify(
+            noise,
+            self.patch_size,
+            self.channels,
+            self.image_size,
+            self.image_size,
+        )
+        return self.boundary_refine(0.5 * x0_pred + 0.5 * x0_corrected).clamp(0.0, 1.0)
+
+    def _sample_hybrid(self, initial: torch.Tensor, num_steps: int) -> torch.Tensor:
+        if num_steps <= 1:
+            return self._sample_consistency(initial)
+
+        x = initial
+        t_start = self.schedule.T - 1
+        t_jump = max(1, t_start // num_steps)
+        t_tensor = torch.full((x.shape[0],), t_start, device=x.device, dtype=torch.long)
+        x0_pred, _, _, _ = self.predict_x0(x, t_tensor)
+        alpha_jump = self.schedule.alphas_cumprod[t_jump]
+        x = torch.sqrt(alpha_jump) * x0_pred + torch.sqrt(1.0 - alpha_jump) * torch.randn_like(x0_pred)
+        remaining_steps = max(num_steps - 1, 1)
+        step_indices = torch.linspace(t_jump, 0, remaining_steps + 1, device=x.device).long().tolist()
+        for idx in range(remaining_steps):
+            t_now = step_indices[idx]
+            t_next = step_indices[idx + 1]
+            t_now_tensor = torch.full((x.shape[0],), t_now, device=x.device, dtype=torch.long)
+            x0_pred, _, _, _ = self.predict_x0(x, t_now_tensor)
+            if t_next == 0:
+                x = x0_pred
+            else:
+                x = self.schedule.q_sample(
+                    x0_pred,
+                    torch.full((x.shape[0],), t_next, device=x.device, dtype=torch.long),
+                )
+        return self.boundary_refine(x).clamp(0.0, 1.0)
 
     @torch.no_grad()
     def sample(
@@ -756,90 +647,74 @@ class SCCDModel(nn.Module):
         steps: int | None = None,
         temperature: float = 1.0,
         truncation: float | None = None,
+        mode: str | None = None,
     ) -> torch.Tensor:
-        """Generate images via consistency sampling.
-
-        Args:
-            n_samples:  Number of images to generate.
-            device:     Target device.
-            c:          Class label tensor  (n_samples,).  Defaults to zeros.
-            steps:      Number of denoising steps (1 = single-step consistency).
-            temperature: Scale applied to the initial noise.
-            truncation:  If set, clamp initial noise to ±truncation.
-
-        Returns:
-            Generated images  (n_samples, C, H, W)  in [0, 1].
-        """
-        if c is None:
-            c = torch.zeros(n_samples, dtype=torch.long, device=device)
-        if steps is None:
-            steps = self.sample_steps
-
-        z = torch.randn(
-            n_samples, self.num_patches, self.latent_dim, device=device
-        ) * float(temperature)
+        del c
+        sample_steps = self.sample_steps if steps is None else int(steps)
+        sample_steps = max(1, sample_steps)
+        mode = self.sampler_mode if mode is None else mode
+        x = torch.randn(n_samples, self.channels, self.image_size, self.image_size, device=device)
+        x = x * float(temperature)
         if truncation is not None:
-            z = z.clamp(-float(truncation), float(truncation))
+            x = x.clamp(-float(truncation), float(truncation))
 
-        # schedule buffers are indexed in [0, T-1]
-        T_buf = torch.full((n_samples,), self.schedule.T - 1, device=device)
+        if mode == "consistency" or sample_steps == 1:
+            return self._sample_consistency(x)
+        if mode == "hybrid":
+            return self._sample_hybrid(x, min(sample_steps, 3))
+        return self._sample_ddim(x, sample_steps, self.ddim_eta)
 
-        if steps == 1:
-            z0 = self.denoiser(z, T_buf, c)
-        else:
-            ts = torch.linspace(self.schedule.T - 1, 0, steps + 1, device=device).long()
-            for i in range(steps):
-                t_cur = ts[i].expand(n_samples)
-                z0 = self.denoiser(z, t_cur, c)
-                if i < steps - 1:
-                    t_next = ts[i + 1].expand(n_samples)
-                    z = self.schedule.q_sample(z0, t_next)   # re-noise (no L → isotropic)
-
-        z0 = self._refine(z0)
-        return self.decode(z0)
-
-    # -----------------------------------------------------------------------
-    # SupportsVAEAPI helpers
-    # -----------------------------------------------------------------------
-
-    def encode(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Alias for encode_distribution (matches gp_vae.py convention)."""
-        return self.encode_distribution(x)
-
-    def get_kl_override(self) -> torch.Tensor | None:
-        return self._cached_kl
-
-    def get_kl_per_dim(self) -> torch.Tensor | None:
-        return self._cached_kl_per_dim
-
-    # -----------------------------------------------------------------------
-    # Factory
-    # -----------------------------------------------------------------------
+    @torch.no_grad()
+    def sample_interpolations(
+        self,
+        n_pairs: int,
+        n_steps: int,
+        device: torch.device,
+        sample_steps: int | None = None,
+    ) -> torch.Tensor:
+        rows: list[torch.Tensor] = []
+        for _ in range(n_pairs):
+            noise_a = torch.randn(1, self.channels, self.image_size, self.image_size, device=device)
+            noise_b = torch.randn(1, self.channels, self.image_size, self.image_size, device=device)
+            alphas = torch.linspace(0.0, 1.0, n_steps, device=device)
+            interp = torch.cat([(1.0 - alpha) * noise_a + alpha * noise_b for alpha in alphas], dim=0)
+            rows.append(self._sample_hybrid(interp, sample_steps or self.sample_steps))
+        return torch.cat(rows, dim=0)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SCCDModel":
-        """Construct from the same config dict format used by build_model()."""
         data_cfg = config.get("data", {})
         model_cfg = config.get("model", {})
+        loss_cfg = config.get("loss", {})
+        image_size = int(data_cfg.get("image_size", 32))
+        patch_div = int(model_cfg.get("patch_div", 2))
+        patch_size = int(model_cfg.get("sccd_patch_size", image_size // patch_div))
         return cls(
-            image_size=data_cfg.get("image_size", 32),
-            patch_div=model_cfg.get("patch_div", 2),
-            in_channels=data_cfg.get("in_channels", 3),
-            latent_dim=model_cfg.get("latent_dim_per_patch", 64),
-            covariance_rank=model_cfg.get("covariance_rank", 8),
-            encoder_channels=model_cfg.get("patch_encoder_channels", [32, 64, 128, 256]),
-            decoder_channels=model_cfg.get("patch_decoder_channels", [256, 128, 64, 32]),
-            transformer_dim=model_cfg.get("transformer_dim", 256),
-            transformer_heads=model_cfg.get("transformer_heads", 8),
-            transformer_layers=model_cfg.get("transformer_layers", 4),
-            transformer_dropout=model_cfg.get("transformer_dropout", 0.1),
-            dit_depth=model_cfg.get("dit_depth", 6),
-            dit_heads=model_cfg.get("dit_heads", 4),
-            dit_dropout=model_cfg.get("dit_dropout", 0.1),
-            num_classes=model_cfg.get("num_classes", 10),
-            T=model_cfg.get("diffusion_T", 1000),
-            sample_steps=model_cfg.get("sample_steps", 1),
-            use_batch_norm=model_cfg.get("use_batch_norm", True),
+            image_size=image_size,
+            patch_size=patch_size,
+            channels=int(data_cfg.get("in_channels", 3)),
+            model_dim=int(model_cfg.get("sccd_model_dim", 256)),
+            num_enc_blocks=int(model_cfg.get("sccd_num_enc_blocks", 2)),
+            num_attn_blocks=int(model_cfg.get("sccd_num_attn_blocks", 4)),
+            heads=int(model_cfg.get("sccd_heads", 4)),
+            head_dim=int(model_cfg.get("sccd_head_dim", 64)),
+            rank=int(model_cfg.get("sccd_rank", 8)),
+            window_size=int(model_cfg.get("sccd_window_size", 2)),
+            global_every=int(model_cfg.get("sccd_global_every", 4)),
+            diffusion_T=int(model_cfg.get("diffusion_T", 1000)),
+            sample_steps=int(model_cfg.get("sample_steps", 2)),
+            sampler_mode=str(model_cfg.get("sccd_sampler_mode", "hybrid")),
+            ddim_eta=float(model_cfg.get("sccd_ddim_eta", 0.0)),
+            rank_gamma=float(model_cfg.get("sccd_rank_gamma", 1.5)),
+            k_min_frac=float(model_cfg.get("sccd_k_min_frac", 0.125)),
+            boundary_hidden=int(model_cfg.get("sccd_boundary_hidden", 64)),
+            boundary_width=int(model_cfg.get("sccd_boundary_width", 2)),
+            lambda_recon=float(loss_cfg.get("sccd_lambda_recon", 1.0)),
+            lambda_boundary=float(loss_cfg.get("sccd_lambda_boundary", 0.1)),
+            lambda_rank=float(loss_cfg.get("sccd_lambda_rank", 0.01)),
+            lambda_sigma=float(loss_cfg.get("sccd_lambda_sigma", 0.05)),
+            sigma_reg_target=float(loss_cfg.get("sccd_sigma_reg_target", 0.3)),
+            min_log_sigma=float(model_cfg.get("sccd_min_log_sigma", -1.5)),
+            max_log_sigma=float(model_cfg.get("sccd_max_log_sigma", 1.5)),
+            log_sigma_temperature=float(model_cfg.get("sccd_log_sigma_temperature", 3.0)),
         )

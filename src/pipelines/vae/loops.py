@@ -27,11 +27,10 @@ def train_one_epoch(
     use_amp: bool,
     criterion: VAELoss,
     disc_optimizer: torch.optim.Optimizer | None = None,
+    train_discriminator: bool = True,
 ) -> tuple[dict[str, float], float]:
     """Run a single training epoch and return aggregate metrics."""
     model.train()
-    if criterion.has_discriminator:
-        criterion.discriminator.train()  # type: ignore[union-attr]
 
     running = {
         "loss": 0.0,
@@ -45,11 +44,27 @@ def train_one_epoch(
     steps_per_epoch = len(loader)
     beta = 0.0
 
+    discriminator = criterion.discriminator
+    adv_weight = criterion.effective_adv_weight if train_discriminator else 0.0
+
+    def _set_disc_requires_grad(enabled: bool) -> None:
+        if discriminator is None:
+            return
+        for param in discriminator.parameters():
+            param.requires_grad_(enabled)
+
     pbar = tqdm(enumerate(loader), total=steps_per_epoch, desc=f"Epoch {epoch + 1:>3d} [train]", leave=False)
     for step, (images, _) in pbar:
         images = images.to(device, non_blocking=True)
         beta = beta_scheduler(epoch, step, steps_per_epoch)
         optimizer.zero_grad(set_to_none=True)
+
+        # For generator updates, we want gradients to flow through the discriminator to
+        # the reconstruction tensor, but we do not want discriminator parameters or BN
+        # running stats to be updated as a side effect.
+        if discriminator is not None:
+            discriminator.eval()
+            _set_disc_requires_grad(False)
 
         with autocast(device.type, enabled=use_amp):
             recon, mu, log_var, _ = model(images)
@@ -60,6 +75,7 @@ def train_one_epoch(
                 log_var,
                 beta,
                 kl_override=get_kl_override(model),
+                adv_weight_override=adv_weight,
             )
 
         if scaler is not None:
@@ -75,20 +91,30 @@ def train_one_epoch(
             optimizer.step()
 
         d_loss_val = 0.0
-        if disc_optimizer is not None:
-            disc_optimizer.zero_grad(set_to_none=True)
+        if discriminator is not None and adv_weight > 0:
+            # Always log a meaningful discriminator loss in training (eval-mode),
+            # even if we are not stepping the discriminator this epoch.
             with autocast(device.type, enabled=use_amp):
-                d_loss = criterion.discriminator_loss(recon.detach(), images)
-            if scaler is not None:
-                scaler.scale(d_loss).backward()
-                scaler.unscale_(disc_optimizer)
-                torch.nn.utils.clip_grad_norm_(criterion.discriminator_params(), grad_clip or 1.0)
-                scaler.step(disc_optimizer)
-            else:
-                d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(criterion.discriminator_params(), grad_clip or 1.0)
-                disc_optimizer.step()
-            d_loss_val = d_loss.item()
+                d_loss_log = criterion.discriminator_loss(recon.detach(), images)
+            d_loss_val = float(d_loss_log.item())
+
+            if disc_optimizer is not None and train_discriminator:
+                discriminator.train()
+                _set_disc_requires_grad(True)
+                disc_optimizer.zero_grad(set_to_none=True)
+                with autocast(device.type, enabled=use_amp):
+                    d_loss = criterion.discriminator_loss(recon.detach(), images)
+                if scaler is not None:
+                    scaler.scale(d_loss).backward()
+                    scaler.unscale_(disc_optimizer)
+                    torch.nn.utils.clip_grad_norm_(criterion.discriminator_params(), grad_clip or 1.0)
+                    scaler.step(disc_optimizer)
+                else:
+                    d_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(criterion.discriminator_params(), grad_clip or 1.0)
+                    disc_optimizer.step()
+                discriminator.eval()
+                _set_disc_requires_grad(False)
 
         if scaler is not None:
             scaler.update()

@@ -115,9 +115,9 @@ def append_val_stats(
     total_epochs: int,
     val_metrics: dict[str, float],
     beta: float,
-    fid: float,
-    ssim: float,
-    psnr: float,
+    fid: float | None,
+    ssim: float | None,
+    psnr: float | None,
 ) -> None:
     append_stats(
         log_path,

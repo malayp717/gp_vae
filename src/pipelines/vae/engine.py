@@ -131,8 +131,13 @@ def train(
     grad_clip = train_cfg.get("gradient_clip_norm")
     save_interval = log_cfg.get("save_interval", 5)
     eval_interval = log_cfg.get("eval_interval", 5)
+    metrics_interval = int(log_cfg.get("metrics_interval", max(eval_interval, 1)))
+    artifact_interval = int(log_cfg.get("artifact_interval", max(eval_interval, 1)))
     num_fid_samples = log_cfg.get("num_fid_samples", 1024)
+    num_samples = int(log_cfg.get("num_samples", 64))
+    num_reconstructions = int(log_cfg.get("num_reconstructions", 16))
     patience = train_cfg.get("early_stopping_patience", 20)
+    disc_train_interval_epochs = int(train_cfg.get("disc_train_interval_epochs", 1))
 
     epochs_without_improvement = 0
     latest_ckpt_path: Path | None = None
@@ -144,6 +149,13 @@ def train(
 
     for epoch in range(start_epoch, epochs):
         criterion.set_epoch(epoch)
+        adv_active = criterion.has_discriminator and criterion.effective_adv_weight > 0
+        train_discriminator = bool(
+            adv_active
+            and disc_optimizer is not None
+            and disc_train_interval_epochs > 0
+            and ((epoch - int(criterion.adv_start_epoch)) % disc_train_interval_epochs == 0)
+        )
         train_metrics, last_beta = train_one_epoch(
             model,
             train_loader,
@@ -156,6 +168,7 @@ def train(
             use_amp,
             criterion=criterion,
             disc_optimizer=disc_optimizer,
+            train_discriminator=train_discriminator,
         )
         lr_scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
@@ -179,6 +192,8 @@ def train(
 
         if (epoch + 1) % eval_interval == 0:
             beta = beta_scheduler(epoch)
+            metrics_due = (epoch + 1) % metrics_interval == 0
+            artifacts_due = (epoch + 1) % artifact_interval == 0
             val_metrics, kl_per_dim = validate_one_epoch(
                 model,
                 val_loader,
@@ -187,10 +202,29 @@ def train(
                 use_amp,
                 criterion=criterion,
             )
-            img_metrics = compute_image_metrics(model, val_loader, device, num_fid_samples=num_fid_samples)
+            img_metrics: dict[str, float | None] = {"fid": None, "ssim": None, "psnr": None}
+            if metrics_due:
+                img_metrics = compute_image_metrics(
+                    model,
+                    val_loader,
+                    device,
+                    num_fid_samples=num_fid_samples,
+                    use_amp=use_amp,
+                )
 
-            save_validation_images(model, val_loader, device, epoch, model_type, run_output_dir, use_amp)
-            if kl_per_dim is not None:
+            if artifacts_due:
+                save_validation_images(
+                    model,
+                    val_loader,
+                    device,
+                    epoch,
+                    model_type,
+                    run_output_dir,
+                    use_amp,
+                    n_images=num_reconstructions,
+                    n_samples=num_samples,
+                )
+            if artifacts_due and kl_per_dim is not None:
                 save_kl_per_dim_artifacts(kl_per_dim, model_type, epoch, logs_dir)
 
             if val_metrics["loss"] < best_val_loss:

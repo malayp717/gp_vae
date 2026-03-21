@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 import torch
+from torch.amp import autocast
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
@@ -19,6 +20,7 @@ def compute_image_metrics(
     device: torch.device,
     num_fid_samples: int = 1024,
     fid_feature_dim: int = 2048,
+    use_amp: bool = False,
 ) -> dict[str, float]:
     """Compute FID, SSIM, and PSNR for a trained VAE."""
     model.eval()
@@ -32,7 +34,8 @@ def compute_image_metrics(
         if collected_real >= num_fid_samples:
             break
         images = images.to(device, non_blocking=True)
-        recon, _, _, _ = model(images)
+        with autocast(device.type, enabled=use_amp):
+            recon, _, _, _ = model(images)
         images_cpu = images.cpu()
         recon_cpu = recon.cpu().clamp(0, 1)
         ssim_metric.update(recon_cpu, images_cpu)
@@ -47,7 +50,9 @@ def compute_image_metrics(
     pbar_gen = tqdm(range(math.ceil(num_fid_samples / batch_size)), desc="Metrics (samples)", leave=False)
     for _ in pbar_gen:
         n = min(batch_size, num_fid_samples - n_generated)
-        samples = model.sample(n, device).cpu().clamp(0, 1)
+        with autocast(device.type, enabled=use_amp):
+            samples = model.sample(n, device)
+        samples = samples.cpu().clamp(0, 1)
         fid_metric.update(samples, real=False)
         n_generated += n
     pbar_gen.close()

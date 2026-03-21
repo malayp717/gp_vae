@@ -57,12 +57,27 @@ class ModelConfig:
     transformer_layers: int = 4
     transformer_dropout: float = 0.1
     covariance_rank: int = 16
-    dit_depth: int = 6
-    dit_heads: int = 4
-    dit_dropout: float = 0.1
     num_classes: int = 10
     diffusion_T: int = 1000
-    sample_steps: int = 1
+    sample_steps: int = 2
+    sccd_patch_size: int = 16
+    sccd_model_dim: int = 256
+    sccd_num_enc_blocks: int = 2
+    sccd_num_attn_blocks: int = 4
+    sccd_heads: int = 4
+    sccd_head_dim: int = 64
+    sccd_rank: int = 8
+    sccd_window_size: int = 2
+    sccd_global_every: int = 4
+    sccd_sampler_mode: str = "hybrid"
+    sccd_ddim_eta: float = 0.0
+    sccd_rank_gamma: float = 1.5
+    sccd_k_min_frac: float = 0.125
+    sccd_boundary_hidden: int = 64
+    sccd_boundary_width: int = 2
+    sccd_min_log_sigma: float = -1.5
+    sccd_max_log_sigma: float = 1.5
+    sccd_log_sigma_temperature: float = 3.0
     ddpm_base_channels: int = 64
     ddpm_channel_multipliers: list[int] = field(default_factory=lambda: [1, 2, 4])
     ddpm_num_res_blocks: int = 2
@@ -81,6 +96,40 @@ class ModelConfig:
             raise ValueError("`model.ddpm_sample_steps` must be positive")
         if cfg.diffusion_T <= 0:
             raise ValueError("`model.diffusion_T` must be positive")
+        if cfg.sccd_patch_size <= 0:
+            raise ValueError("`model.sccd_patch_size` must be positive")
+        if cfg.sccd_model_dim <= 0:
+            raise ValueError("`model.sccd_model_dim` must be positive")
+        if cfg.sccd_num_enc_blocks <= 0:
+            raise ValueError("`model.sccd_num_enc_blocks` must be positive")
+        if cfg.sccd_num_attn_blocks <= 0:
+            raise ValueError("`model.sccd_num_attn_blocks` must be positive")
+        if cfg.sccd_heads <= 0:
+            raise ValueError("`model.sccd_heads` must be positive")
+        if cfg.sccd_head_dim <= 0:
+            raise ValueError("`model.sccd_head_dim` must be positive")
+        if cfg.sccd_rank <= 0:
+            raise ValueError("`model.sccd_rank` must be positive")
+        if cfg.sccd_window_size <= 0:
+            raise ValueError("`model.sccd_window_size` must be positive")
+        if cfg.sccd_global_every <= 0:
+            raise ValueError("`model.sccd_global_every` must be positive")
+        if cfg.sccd_sampler_mode not in {"consistency", "hybrid", "ddim"}:
+            raise ValueError("`model.sccd_sampler_mode` must be one of {'consistency', 'hybrid', 'ddim'}")
+        if not 0.0 <= cfg.sccd_ddim_eta <= 1.0:
+            raise ValueError("`model.sccd_ddim_eta` must be in [0, 1]")
+        if cfg.sccd_rank_gamma < 0.0:
+            raise ValueError("`model.sccd_rank_gamma` must be non-negative")
+        if not 0.0 < cfg.sccd_k_min_frac <= 1.0:
+            raise ValueError("`model.sccd_k_min_frac` must be in (0, 1]")
+        if cfg.sccd_boundary_hidden <= 0:
+            raise ValueError("`model.sccd_boundary_hidden` must be positive")
+        if cfg.sccd_boundary_width <= 0:
+            raise ValueError("`model.sccd_boundary_width` must be positive")
+        if cfg.sccd_min_log_sigma >= cfg.sccd_max_log_sigma:
+            raise ValueError("`model.sccd_min_log_sigma` must be less than `model.sccd_max_log_sigma`")
+        if cfg.sccd_log_sigma_temperature <= 0.0:
+            raise ValueError("`model.sccd_log_sigma_temperature` must be positive")
         if cfg.ddpm_num_res_blocks <= 0:
             raise ValueError("`model.ddpm_num_res_blocks` must be positive")
         if cfg.ddpm_base_channels <= 0:
@@ -132,6 +181,7 @@ class TrainingConfig:
     early_stopping_patience: int = 20
     ema_decay: float = 0.999
     consistency_k_steps: int = 5
+    disc_train_interval_epochs: int = 5
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TrainingConfig":
@@ -142,6 +192,8 @@ class TrainingConfig:
             raise ValueError("`training.consistency_k_steps` must be positive")
         if not 0.0 < cfg.ema_decay <= 1.0:
             raise ValueError("`training.ema_decay` must be in (0, 1]")
+        if cfg.disc_train_interval_epochs <= 0:
+            raise ValueError("`training.disc_train_interval_epochs` must be positive")
         return cfg
 
 
@@ -157,6 +209,11 @@ class LossConfig:
     disc_channels: int = 64
     disc_layers: int = 3
     consistency_weight: float = 1.0
+    sccd_lambda_recon: float = 1.0
+    sccd_lambda_boundary: float = 0.5
+    sccd_lambda_rank: float = 0.25
+    sccd_lambda_sigma: float = 1.0
+    sccd_sigma_reg_target: float = 0.3
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LossConfig":
@@ -165,6 +222,16 @@ class LossConfig:
             raise ValueError(f"Unsupported LPIPS backbone: {cfg.lpips_net!r}")
         if cfg.consistency_weight < 0.0:
             raise ValueError("`loss.consistency_weight` must be non-negative")
+        if cfg.sccd_lambda_recon < 0.0:
+            raise ValueError("`loss.sccd_lambda_recon` must be non-negative")
+        if cfg.sccd_lambda_boundary < 0.0:
+            raise ValueError("`loss.sccd_lambda_boundary` must be non-negative")
+        if cfg.sccd_lambda_rank < 0.0:
+            raise ValueError("`loss.sccd_lambda_rank` must be non-negative")
+        if cfg.sccd_lambda_sigma < 0.0:
+            raise ValueError("`loss.sccd_lambda_sigma` must be non-negative")
+        if cfg.sccd_sigma_reg_target <= 0.0:
+            raise ValueError("`loss.sccd_sigma_reg_target` must be positive")
         return cfg
 
 
@@ -212,6 +279,8 @@ class LoggingConfig:
     log_interval: int = 50
     save_interval: int = 5
     eval_interval: int = 5
+    metrics_interval: int = 25
+    artifact_interval: int = 25
     num_fid_samples: int = 1024
     num_samples: int = 64
     num_reconstructions: int = 16
@@ -219,8 +288,20 @@ class LoggingConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LoggingConfig":
         cfg = cls(**data)
+        if cfg.eval_interval <= 0:
+            raise ValueError("`logging.eval_interval` must be positive")
+        if cfg.metrics_interval <= 0:
+            raise ValueError("`logging.metrics_interval` must be positive")
+        if cfg.artifact_interval <= 0:
+            raise ValueError("`logging.artifact_interval` must be positive")
         if cfg.save_interval <= 0:
             raise ValueError("`logging.save_interval` must be positive")
+        if cfg.num_fid_samples <= 0:
+            raise ValueError("`logging.num_fid_samples` must be positive")
+        if cfg.num_samples <= 0:
+            raise ValueError("`logging.num_samples` must be positive")
+        if cfg.num_reconstructions <= 0:
+            raise ValueError("`logging.num_reconstructions` must be positive")
         return cfg
 
 

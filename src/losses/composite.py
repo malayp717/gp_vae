@@ -52,7 +52,7 @@ def _build_lpips(net: str, device: torch.device | str) -> _lpips_lib.LPIPS:
 
 
 class VAELoss(nn.Module):
-    """Composite VAE loss: MSE + beta-KL + optional LPIPS + optional adversarial."""
+    """Composite VAE loss: L1 + beta-KL + optional LPIPS + optional adversarial."""
 
     def __init__(
         self,
@@ -122,7 +122,7 @@ class VAELoss(nn.Module):
 
     @staticmethod
     def reconstruction_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.mse_loss(recon, target, reduction="sum") / target.size(0)
+        return F.l1_loss(recon, target, reduction="sum") / target.size(0)
 
     @staticmethod
     def kl_divergence(
@@ -163,6 +163,7 @@ class VAELoss(nn.Module):
         log_var: torch.Tensor,
         beta: float = 1.0,
         kl_override: torch.Tensor | None = None,
+        adv_weight_override: float | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         recon_loss = self.reconstruction_loss(recon, target)
         kl_loss = self.kl_divergence(mu, log_var, kl_override)
@@ -175,7 +176,7 @@ class VAELoss(nn.Module):
         else:
             lpips_loss = zero
 
-        adv_weight = self.effective_adv_weight
+        adv_weight = self.effective_adv_weight if adv_weight_override is None else float(adv_weight_override)
         if self._discriminator is not None and adv_weight > 0:
             adv_g_loss = self.generator_adv_loss(recon)
             total = total + adv_weight * adv_g_loss

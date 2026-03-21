@@ -23,6 +23,7 @@ def save_validation_images(
     output_dir: Path,
     use_amp: bool,
     n_images: int = 10,
+    n_samples: int | None = None,
 ) -> None:
     """Save reconstruction pairs and prior samples during validation."""
     model.eval()
@@ -49,14 +50,16 @@ def save_validation_images(
     grid = make_grid(paired, nrow=n_images, padding=2, normalize=False)
     save_image(grid, recon_dir / f"{model_type}_epoch_{epoch + 1:04d}.png")
 
-    samples = model.sample(n_images, device).cpu().clamp(0, 1)
-    grid_s = make_grid(samples, nrow=5, padding=2, normalize=False)
+    sample_count = n_images if n_samples is None else int(n_samples)
+    samples = model.sample(sample_count, device).cpu().clamp(0, 1)
+    grid_cols = min(5, sample_count)
+    grid_s = make_grid(samples, nrow=grid_cols, padding=2, normalize=False)
     save_image(grid_s, sample_dir / f"{model_type}_epoch_{epoch + 1:04d}.png")
 
     logger.info(
         "Saved %d reconstruction pairs -> %s  |  %d samples -> %s",
         n_images,
         recon_dir.name,
-        n_images,
+        sample_count,
         sample_dir.name,
     )
