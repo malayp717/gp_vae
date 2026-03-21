@@ -19,12 +19,12 @@ model:
 
   # --- VAE (convolutional) ---
   latent_dim: 128
-  encoder_channels: [32, 64, 128, 128, 256]
-  decoder_channels: [256, 128, 128, 64, 32]
+  encoder_channels: [32, 64, 128, 256]
+  decoder_channels: [256, 128, 64, 32]
 
   # --- Patch models (GP-VAE / SC-PDT `sccd`) ---
   patch_div: 2
-  latent_dim_per_patch: 256
+  latent_dim_per_patch: 128
   patch_encoder_channels: [32, 64, 128, 256]
   patch_decoder_channels: [256, 128, 64, 32]
 
@@ -69,8 +69,8 @@ model:
 beta_annealing:
   enabled: true
   schedule: cosine
-  beta_min: 0.001
-  beta_max: 0.4
+  beta_min: 0.5
+  beta_max: 1.0
   warmup_epochs: 80
   cycle_epochs: 40
   n_cycles: 4
