@@ -200,6 +200,7 @@ class TrainingConfig:
 @dataclass(slots=True)
 class LossConfig:
     recon_weight: float = 1.0
+    free_bits_nats: float = 0.0
     lpips_enabled: bool = False
     lpips_weight: float = 0.25
     lpips_net: str = "alex"
@@ -220,6 +221,8 @@ class LossConfig:
         cfg = cls(**data)
         if cfg.lpips_net not in {"alex", "vgg"}:
             raise ValueError(f"Unsupported LPIPS backbone: {cfg.lpips_net!r}")
+        if cfg.free_bits_nats < 0.0:
+            raise ValueError("`loss.free_bits_nats` must be non-negative")
         if cfg.consistency_weight < 0.0:
             raise ValueError("`loss.consistency_weight` must be non-negative")
         if cfg.sccd_lambda_recon < 0.0:

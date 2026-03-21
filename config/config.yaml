@@ -14,7 +14,7 @@ data:
 
 model:
   type: gp_vae                  # can be [vae, gp_vae, sccd, ddpm]
-  dropout: 0.1
+  dropout: 0.0
   use_batch_norm: true
 
   # --- VAE (convolutional) ---
@@ -68,10 +68,10 @@ model:
 
 beta_annealing:
   enabled: true
-  schedule: cyclical
-  beta_min: 0.05
-  beta_max: 0.2
-  warmup_epochs: 20
+  schedule: cosine
+  beta_min: 0.001
+  beta_max: 0.4
+  warmup_epochs: 80
   cycle_epochs: 40
   n_cycles: 4
   ratio_increase: 0.5
@@ -89,6 +89,7 @@ training:
 
 loss:
   recon_weight: 1.0
+  free_bits_nats: 0.1
   lpips_enabled: true
   lpips_weight: 0.25
   lpips_net: alex

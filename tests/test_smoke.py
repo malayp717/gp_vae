@@ -30,6 +30,7 @@ class RefactorSmokeTests(unittest.TestCase):
         self.assertEqual(config["logging"]["save_interval"], typed.logging.save_interval)
         self.assertEqual(config["logging"]["metrics_interval"], typed.logging.metrics_interval)
         self.assertEqual(config["logging"]["artifact_interval"], typed.logging.artifact_interval)
+        self.assertAlmostEqual(config["loss"]["free_bits_nats"], typed.loss.free_bits_nats)
         diffusion_typed = load_typed_config(
             overrides={
                 "model": {
@@ -63,6 +64,7 @@ class RefactorSmokeTests(unittest.TestCase):
                     "sccd_max_log_sigma": 0.5,
                 },
                 "loss": {
+                    "free_bits_nats": 0.05,
                     "sccd_lambda_recon": 1.2,
                     "sccd_lambda_boundary": 0.2,
                     "sccd_lambda_rank": 0.05,
@@ -76,6 +78,7 @@ class RefactorSmokeTests(unittest.TestCase):
         self.assertEqual(sccd_typed.model.sample_steps, 3)
         self.assertAlmostEqual(sccd_typed.model.sccd_min_log_sigma, -1.0)
         self.assertAlmostEqual(sccd_typed.model.sccd_max_log_sigma, 0.5)
+        self.assertAlmostEqual(sccd_typed.loss.free_bits_nats, 0.05)
         self.assertAlmostEqual(sccd_typed.loss.sccd_lambda_recon, 1.2)
         self.assertAlmostEqual(sccd_typed.loss.sccd_lambda_boundary, 0.2)
         self.assertAlmostEqual(sccd_typed.loss.sccd_lambda_rank, 0.05)
@@ -151,6 +154,19 @@ class RefactorSmokeTests(unittest.TestCase):
 
         self.assertGreater(losses["sigma_penalty"].item(), 0.0)
         self.assertTrue(torch.isfinite(losses["total"]))
+
+    def test_vae_loss_free_bits_prevents_zero_kl(self) -> None:
+        from src.losses import VAELoss
+
+        loss_fn = VAELoss(free_bits_nats=0.1)
+        x = torch.zeros(2, 3, 4, 4)
+        mu = torch.zeros(2, 8)
+        log_var = torch.zeros(2, 8)
+
+        loss, comps = loss_fn(x, x, mu, log_var, beta=1.0)
+
+        self.assertAlmostEqual(comps["kl"].item(), 0.8, places=5)
+        self.assertTrue(torch.isfinite(loss))
 
     def test_patch_discriminator_uses_spectral_norm(self) -> None:
         disc = PatchDiscriminator(in_channels=3, base_channels=16, n_layers=2)

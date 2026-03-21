@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .adversarial import PatchDiscriminator
+from .kl import diagonal_kl_per_dim
 
 
 def _default_lpips_weights_path(net: str, version: str = "0.1") -> Path:
@@ -57,6 +58,7 @@ class VAELoss(nn.Module):
     def __init__(
         self,
         recon_weight: float = 1.0,
+        free_bits_nats: float = 0.0,
         lpips_enabled: bool = False,
         lpips_weight: float = 0.0,
         lpips_net: str = "vgg",
@@ -70,6 +72,7 @@ class VAELoss(nn.Module):
     ) -> None:
         super().__init__()
         self.recon_weight = recon_weight
+        self.free_bits_nats = float(free_bits_nats)
         self.lpips_enabled = lpips_enabled
         self.lpips_weight = lpips_weight if lpips_enabled else 0.0
         self._lpips_fn: _lpips_lib.LPIPS | None = None
@@ -124,15 +127,18 @@ class VAELoss(nn.Module):
     def reconstruction_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.l1_loss(recon, target, reduction="sum") / target.size(0)
 
-    @staticmethod
     def kl_divergence(
+        self,
         mu: torch.Tensor,
         log_var: torch.Tensor,
         kl_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if kl_override is not None:
             return kl_override
-        return -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / mu.size(0)
+        kl_per_dim = diagonal_kl_per_dim(mu, log_var)
+        if self.free_bits_nats > 0.0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits_nats)
+        return kl_per_dim.sum()
 
     def perceptual_loss(self, recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self._lpips_fn is None:
@@ -200,6 +206,7 @@ class VAELoss(nn.Module):
         data_cfg = config.get("data", {})
         return cls(
             recon_weight=loss_cfg.get("recon_weight", 1.0),
+            free_bits_nats=loss_cfg.get("free_bits_nats", 0.0),
             lpips_enabled=loss_cfg.get("lpips_enabled", False),
             lpips_weight=loss_cfg.get("lpips_weight", 0.0),
             lpips_net=loss_cfg.get("lpips_net", "vgg"),
