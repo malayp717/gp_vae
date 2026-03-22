@@ -24,7 +24,7 @@ model:
 
   # --- Patch models (GP-VAE / SC-PDT `sccd`) ---
   patch_div: 2
-  latent_dim_per_patch: 128
+  latent_dim_per_patch: 64
   patch_encoder_channels: [32, 64, 128, 256]
   patch_decoder_channels: [256, 128, 64, 32]
 
@@ -69,8 +69,8 @@ model:
 beta_annealing:
   enabled: true
   schedule: cosine
-  beta_min: 0.5
-  beta_max: 1.0
+  beta_min: 0.01
+  beta_max: 0.2
   warmup_epochs: 80
   cycle_epochs: 40
   n_cycles: 4
@@ -78,7 +78,7 @@ beta_annealing:
 
 training:
   epochs: 200
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-4
   weight_decay: 1.0e-4
   gradient_clip_norm: 1.0
   seed: 42
@@ -89,7 +89,7 @@ training:
 
 loss:
   recon_weight: 1.0
-  free_bits_nats: 0.1
+  free_bits_nats: 0.25
   lpips_enabled: true
   lpips_weight: 0.25
   lpips_net: alex
